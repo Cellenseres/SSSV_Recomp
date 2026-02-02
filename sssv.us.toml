@@ -1,0 +1,104 @@
+# Space Station Silicon Valley - Recompilation Configuration
+# ============================================================================
+
+[input]
+entrypoint = 0x80125900
+symbols_file_path = "SSSVRecompSyms/sssv.us.syms.toml"
+output_func_path = "RecompiledFuncs"
+rom_file_path = "sssv.us.z64"
+
+[patches]
+renamed = ["strncpy"]
+
+# ============================================================================
+# Overlay Loading Hook
+# ============================================================================
+
+[[patches.hook]]
+func = "dma_read"
+text = "load_overlays(ctx->r4, ctx->r5, ctx->r6);"
+before_vram = 0x80129290
+
+# ============================================================================
+# Widescreen Hooks - Core
+# ============================================================================
+
+# Hook at load_default_display_list - enables extended GBI and applies widescreen
+# This is called early in display list construction
+[[patches.hook]]
+func = "load_default_display_list"
+text = """
+extern void sssv_widescreen_pre_render(uint8_t*, recomp_context*);
+extern void sssv_enable_extended_gbi(uint8_t*, recomp_context*);
+sssv_widescreen_pre_render(rdram, ctx);
+sssv_enable_extended_gbi(rdram, ctx);
+"""
+before_vram = 0x8012C1F0
+
+# Hook at guPerspective to adjust aspect ratio for projection matrix
+[[patches.hook]]
+func = "guPerspective"
+text = "extern float sssv_get_target_aspect_ratio(float); ctx->f14.fl = sssv_get_target_aspect_ratio(ctx->f14.fl);"
+before_vram = 0x8013F5BC
+
+# Hook at set_screen_scaling - force widescreen state
+[[patches.hook]]
+func = "set_screen_scaling"
+text = """
+extern void sssv_force_widescreen_state(uint8_t*, recomp_context*);
+sssv_force_widescreen_state(rdram, ctx);
+"""
+before_vram = 0x8012AB94
+
+# Hook at end_display_lists - final viewport correction
+[[patches.hook]]
+func = "end_display_lists"
+text = """
+extern void sssv_widescreen_end_frame(uint8_t*, recomp_context*);
+sssv_widescreen_end_frame(rdram, ctx);
+"""
+before_vram = 0x8012A490
+
+# ============================================================================
+# Widescreen Hooks - Overlay Render Functions
+# These are the main render loops that reset gScreenWidth
+# ============================================================================
+
+# Hook at the START of func_80294E50_6A6500 (overlay2 main game render)
+# This function resets gScreenWidth to 320 - we must override BEFORE scissors
+[[patches.hook]]
+func = "func_80294E50_6A6500"
+text = """
+extern void sssv_widescreen_pre_render(uint8_t*, recomp_context*);
+sssv_widescreen_pre_render(rdram, ctx);
+"""
+before_vram = 0x80294E50
+
+# Hook AFTER viewport setup in func_80294E50_6A6500 to verify/fix values
+# This is after the game calculates D_80152EA8 viewport from gScreenWidth
+[[patches.hook]]
+func = "func_80294E50_6A6500"
+text = """
+extern void sssv_fix_viewport_after_game(uint8_t*, recomp_context*);
+sssv_fix_viewport_after_game(rdram, ctx);
+"""
+before_vram = 0x80295080
+
+# Hook at the START of func_802988E8_63BF88 (overlay1 menu render)
+[[patches.hook]]
+func = "func_802988E8_63BF88"
+text = """
+extern void sssv_widescreen_pre_render(uint8_t*, recomp_context*);
+sssv_widescreen_pre_render(rdram, ctx);
+"""
+before_vram = 0x802988E8
+
+# Hook at func_8038FF68_7A1618 (overlay2 menu code within game)
+[[patches.hook]]
+func = "func_8038FF68_7A1618"
+text = """
+extern void sssv_widescreen_pre_render(uint8_t*, recomp_context*);
+sssv_widescreen_pre_render(rdram, ctx);
+"""
+before_vram = 0x8038FF68
+

@@ -1,0 +1,27 @@
+compiler_type = "ido"
+
+[preserve_macros]
+"_?g[DS]P.*" = "void"
+"G_IM_SIZ_.*" = "int"
+"G_[AC]C.*" = "int"
+"G_MTX_.*" = "int"
+"SP_UCODE_DATA_SIZE" = "int"
+"FRUSTRATIO_.*" = "int"
+"FR_[PN].*" = "int"
+"MIN" = "int"
+"MAX" = "int"
+"ABS" = "int"
+"SIGNUM" = "int"
+"SFX_.*" = "int"
+"ATTACK_.*" = "int"
+"FTOFIX32" = "int"
+"GPACK_RGBA5551" =" int"
+"OS_K0_TO_PHYSICAL" = "int"
+"SSSV_RAND" = "int"
+"SQ" = "int"
+"NULL" = "int"
+"SIN" = "int"
+"COS" = "int"
+
+[decompme.compilers]
+"tools/ido5.3_recomp/cc" = "ido5.3"
