@@ -2,6 +2,8 @@
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
+#include <chrono>
+#include <cstring>
 
 #include "recomp.h"
 #include "recompui/recompui.h"
@@ -48,6 +50,7 @@ constexpr gpr ADDR_VP_UI             = vram32(0x803B66F0);
 constexpr gpr ADDR_WIDESCREEN_FLAG   = vram32(0x8020540C);
 constexpr gpr ADDR_VIDATA_WIDTH      = vram32(0x802053EA);  // D_802053E0.screenWidth
 constexpr gpr ADDR_D_803F2D50_UNKDA  = vram32(0x803F2E2A);  // Source for gScreenWidth
+constexpr gpr ADDR_GFX_PTR           = vram32(0x801D9EB8);  // D_801D9EB8 (Gfx* display list)
 
 // Base dimensions
 constexpr float BASE_WIDTH  = 320.0f;
@@ -77,6 +80,14 @@ inline int16_t read_s16(uint8_t* rdram, gpr vram) {
     return static_cast<int16_t>(MEM_H(0, vram));
 }
 
+inline uint16_t read_u16(uint8_t* rdram, gpr vram) {
+    return static_cast<uint16_t>(MEM_H(0, vram));
+}
+
+inline uint32_t read_u32(uint8_t* rdram, gpr vram) {
+    return static_cast<uint32_t>(MEM_W(0, vram));
+}
+
 // Helper: Write viewport scale and translate values
 // N64 viewport uses 2x multiplier for subpixel precision
 void write_viewport(uint8_t* rdram, gpr vram,
@@ -86,6 +97,29 @@ void write_viewport(uint8_t* rdram, gpr vram,
     write_s16(rdram, vram + 2,  static_cast<int16_t>(scale_y * 2));  // vscale[1]
     write_s16(rdram, vram + 8,  static_cast<int16_t>(trans_x * 2));  // vtrans[0]
     write_s16(rdram, vram + 10, static_cast<int16_t>(trans_y * 2));  // vtrans[1]
+}
+
+bool try_get_gfx_ptr(uint8_t* rdram, gpr vram_ptr, GfxCommand*& out_cmd, gpr& out_gdl, uint8_t*& out_gfx_mem) {
+    gpr gdl = MEM_W(0, vram_ptr);
+    if (gdl == 0) {
+        return false;
+    }
+
+    int32_t gdl_signed = static_cast<int32_t>(gdl);
+    uint32_t addr = static_cast<uint32_t>(gdl_signed - static_cast<int32_t>(0x80000000));
+    if (addr >= 0x800000) {
+        return false;
+    }
+
+    out_gfx_mem = rdram + addr;
+    out_cmd = reinterpret_cast<GfxCommand*>(out_gfx_mem);
+    out_gdl = gdl;
+    return true;
+}
+
+void advance_gfx_ptr(uint8_t* rdram, uint8_t* gfx_mem, GfxCommand* cmd, gpr& gdl, gpr vram_ptr) {
+    gdl = ADD32(gdl, static_cast<gpr>(reinterpret_cast<uint8_t*>(cmd) - gfx_mem));
+    MEM_W(0, vram_ptr) = static_cast<int32_t>(gdl);
 }
 
 // Calculate target aspect ratio from window size
