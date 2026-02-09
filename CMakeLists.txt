@@ -88,6 +88,7 @@ set (SOURCES
     ${CMAKE_SOURCE_DIR}/src/main/launcher_animation.cpp
     ${CMAKE_SOURCE_DIR}/src/game/config.cpp
     ${CMAKE_SOURCE_DIR}/src/game/recomp_api.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/sssv_billboard_rewrite.cpp
     ${CMAKE_SOURCE_DIR}/rsp/aspMain.cpp
 )
 
