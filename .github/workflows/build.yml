@@ -1,0 +1,282 @@
+# Build SSSVRecompiled for Windows, Linux, and macOS.
+# RecompiledFuncs are generated during CI from the ROM (private repo).
+
+name: validate
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      N64RECOMP_COMMIT:
+        description: 'N64Recomp commit hash'
+        required: false
+        default: '81213c1831fab2521a6a5459c67b63437d67e253'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  N64RECOMP_COMMIT: ${{ inputs.N64RECOMP_COMMIT || '81213c1831fab2521a6a5459c67b63437d67e253' }}
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        type: [Debug, Release]
+    name: ubuntu-24.04 (x64, ${{ matrix.type }}, Native)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          submodules: recursive
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-sssv-ccache-${{ matrix.type }}-x64
+
+      - name: Install Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsdl2-dev libgtk-3-dev lld llvm clang gcc \
+            libx11-dev libxrandr-dev libfreetype-dev libvulkan-dev libfuse2
+
+      - name: Get Private Content
+        uses: actions/checkout@v4
+        with:
+          repository: Cellenseres/SSSV_Recomp_PrivateContent
+          token: ${{ secrets.PRIVATE_CONTENT_TOKEN }}
+          path: sssv-private
+
+      - name: Prepare ROM
+        run: cp sssv-private/sssv.us.z64 ./
+
+      - name: Build N64Recomp & RSPRecomp
+        run: |
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          git clone https://github.com/Mr-Wiseguy/N64Recomp.git --recurse-submodules N64RecompSource
+          cd N64RecompSource
+          git checkout ${{ env.N64RECOMP_COMMIT }}
+          git submodule update --init --recursive
+          cmake -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_MAKE_PROGRAM=ninja -G Ninja -S . -B cmake-build
+          cmake --build cmake-build --config Release --target N64RecompCLI -j $(nproc)
+          cmake --build cmake-build --config Release --target RSPRecomp -j $(nproc)
+          cp cmake-build/N64Recomp ../
+          cp cmake-build/RSPRecomp ../
+
+      - name: Run N64Recomp & RSPRecomp
+        run: |
+          ./N64Recomp sssv.us.toml
+          ./RSPRecomp aspMain.toml
+
+      - name: Build SSSVRecompiled
+        run: |-
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          cmake -DCMAKE_BUILD_TYPE=${{ matrix.type }} -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang -DCMAKE_MAKE_PROGRAM=ninja -G Ninja -S . -B cmake-build
+          cmake --build cmake-build --config ${{ matrix.type }} --target SSSVRecompiled -j $(nproc)
+
+      - name: Prepare Archive
+        run: |
+          mv cmake-build/SSSVRecompiled SSSVRecompiled
+          tar -czf SSSVRecompiled.tar.gz SSSVRecompiled
+
+      - name: Archive SSSVRecompiled
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSSVRecompiled-${{ runner.os }}-X64-${{ matrix.type }}
+          path: SSSVRecompiled.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        type: [Debug, RelWithDebInfo]
+    name: windows (${{ matrix.type }})
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          submodules: recursive
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-sssv-ccache-${{ matrix.type }}
+
+      - name: Install Windows Dependencies
+        run: |
+          choco install ninja -y
+          Remove-Item -Path "C:\ProgramData\Chocolatey\bin\ccache.exe" -Force -ErrorAction SilentlyContinue
+
+      - name: Download portable LLVM
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.3/LLVM-19.1.3-Windows-X64.tar.xz" -OutFile "LLVM.tar.xz"
+          New-Item -ItemType Directory -Path portable-llvm > $null
+          7z x LLVM.tar.xz
+          7z x LLVM.tar -oportable-llvm
+
+      - name: Configure Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Get Private Content
+        uses: actions/checkout@v4
+        with:
+          repository: Cellenseres/SSSV_Recomp_PrivateContent
+          token: ${{ secrets.PRIVATE_CONTENT_TOKEN }}
+          path: sssv-private
+
+      - name: Prepare ROM
+        run: Copy-Item -Path "sssv-private/sssv.us.z64" -Destination "./"
+
+      - name: Build N64Recomp & RSPRecomp
+        run: |
+          $cpuCores = (Get-CimInstance -ClassName Win32_Processor).NumberOfLogicalProcessors
+          git clone https://github.com/Mr-Wiseguy/N64Recomp.git --recurse-submodules N64RecompSource
+          cd N64RecompSource
+          git checkout ${{ env.N64RECOMP_COMMIT }}
+          git submodule update --init --recursive
+          cmake -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_MAKE_PROGRAM=ninja -G Ninja -S . -B cmake-build `
+            -DCMAKE_CXX_FLAGS="-Xclang -fexceptions -Xclang -fcxx-exceptions"
+          cmake --build cmake-build --config Release --target N64RecompCLI -j $cpuCores
+          cmake --build cmake-build --config Release --target RSPRecomp -j $cpuCores
+          Copy-Item -Path "cmake-build/N64Recomp.exe" -Destination "../"
+          Copy-Item -Path "cmake-build/RSPRecomp.exe" -Destination "../"
+
+      - name: Run N64Recomp & RSPRecomp
+        run: |
+          ./N64Recomp.exe sssv.us.toml
+          ./RSPRecomp.exe aspMain.toml
+
+      - name: Build SSSVRecompiled
+        run: |-
+          set $env:PATH="$env:USERPROFILE/.cargo/bin;$env:PATH"
+          $cpuCores = (Get-CimInstance -ClassName Win32_Processor).NumberOfLogicalProcessors
+          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -ne 'C:\Program Files\LLVM\bin' }) -join ';'
+          cmake -DCMAKE_BUILD_TYPE=${{ matrix.type }} -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_C_COMPILER=clang-cl -DCMAKE_MAKE_PROGRAM=ninja `
+            -DPATCHES_C_COMPILER="..\portable-llvm\LLVM-19.1.3-Windows-X64\bin\clang" -DPATCHES_LD="..\portable-llvm\LLVM-19.1.3-Windows-X64\bin\ld.lld" `
+            -G Ninja -S . -B cmake-build -DCMAKE_CXX_FLAGS="-Xclang -fexceptions -Xclang -fcxx-exceptions"
+          cmake --build cmake-build --config ${{ matrix.type }} --target SSSVRecompiled -j $cpuCores
+
+      - name: Prepare Archive
+        run: |
+          Move-Item -Path "cmake-build/SSSVRecompiled.exe" -Destination "SSSVRecompiled.exe"
+          Move-Item -Path "cmake-build/dxcompiler.dll" -Destination "dxcompiler.dll"
+          Move-Item -Path "cmake-build/dxil.dll" -Destination "dxil.dll"
+          Move-Item -Path "cmake-build/SDL2.dll" -Destination "SDL2.dll"
+          Move-Item -Path "cmake-build/SSSVRecompiled.pdb" -Destination "SSSVRecompiled.pdb" -ErrorAction SilentlyContinue
+
+      - name: Archive SSSVRecompiled
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSSVRecompiled-${{ runner.os }}-${{ matrix.type }}
+          path: |
+            SSSVRecompiled.exe
+            dxcompiler.dll
+            dxil.dll
+            SDL2.dll
+
+      - name: Archive Debug Files
+        if: matrix.type == 'Debug'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSSVRecompiled-PDB-${{ matrix.type }}
+          path: SSSVRecompiled.pdb
+
+  build-macos:
+    runs-on: macos-14
+    strategy:
+      matrix:
+        type: [Debug, Release]
+    name: macos (x64, arm64, ${{ matrix.type }})
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          submodules: recursive
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-sssv-ccache-${{ matrix.type }}
+
+      - name: Homebrew Setup
+        run: |
+          brew install ninja
+          brew uninstall --ignore-dependencies libpng freetype
+
+      - name: MacPorts Setup
+        uses: melusina-org/setup-macports@v1
+        id: macports
+        with:
+          parameters: '.github/macos/macports.yaml'
+
+      - name: Install macholib for ld64 wrapper
+        run: pip3 install --break-system-packages macholib
+
+      - name: Get Private Content
+        uses: actions/checkout@v4
+        with:
+          repository: Cellenseres/SSSV_Recomp_PrivateContent
+          token: ${{ secrets.PRIVATE_CONTENT_TOKEN }}
+          path: sssv-private
+
+      - name: Prepare ROM
+        run: cp sssv-private/sssv.us.z64 ./
+
+      - name: Build N64Recomp & RSPRecomp
+        run: |
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          git clone https://github.com/Mr-Wiseguy/N64Recomp.git --recurse-submodules N64RecompSource
+          cd N64RecompSource
+          git checkout ${{ env.N64RECOMP_COMMIT }}
+          git submodule update --init --recursive
+          cmake -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_MAKE_PROGRAM=ninja -G Ninja -S . -B cmake-build
+          cmake --build cmake-build --config Release --target N64RecompCLI -j $(sysctl -n hw.ncpu)
+          cmake --build cmake-build --config Release --target RSPRecomp -j $(sysctl -n hw.ncpu)
+          cp cmake-build/N64Recomp ../
+          cp cmake-build/RSPRecomp ../
+
+      - name: Run N64Recomp & RSPRecomp
+        run: |
+          ./N64Recomp sssv.us.toml
+          ./RSPRecomp aspMain.toml
+
+      - name: Build SSSVRecompiled
+        run: |-
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          chmod +x .github/macos/ld64
+          cmake -DCMAKE_BUILD_TYPE=${{ matrix.type }} -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_MAKE_PROGRAM=ninja -G Ninja -S . -B cmake-build \
+            -DPATCHES_LD=/opt/local/bin/ld.lld-mp-18 -DCMAKE_AR=/opt/local/bin/llvm-ar-mp-18 -DPATCHES_C_COMPILER=/opt/local/bin/clang-mp-18 \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
+          cmake --build cmake-build --config ${{ matrix.type }} --target SSSVRecompiled -j $(sysctl -n hw.ncpu)
+
+      - name: Prepare Archive
+        run: |
+          mv cmake-build/SSSVRecompiled SSSVRecompiled
+          zip -r -y SSSVRecompiled.zip SSSVRecompiled
+
+      - name: Archive SSSVRecompiled
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSSVRecompiled-${{ runner.os }}-${{ matrix.type }}
+          path: SSSVRecompiled.zip
