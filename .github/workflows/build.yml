@@ -25,11 +25,11 @@ env:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         type: [Debug, Release]
-    name: ubuntu-22.04 (x64, ${{ matrix.type }}, Native)
+    name: ubuntu-24.04 (x64, ${{ matrix.type }}, Native)
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -229,7 +229,7 @@ jobs:
           parameters: '.github/macos/macports.yaml'
 
       - name: Install macholib for ld64 wrapper
-        run: pip3 install macholib
+        run: pip3 install --break-system-packages macholib
 
       - name: Get Private Content
         uses: actions/checkout@v4
