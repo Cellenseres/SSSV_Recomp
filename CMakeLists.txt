@@ -216,6 +216,11 @@ target_compile_options(RecompiledFuncs PRIVATE
   -Wno-implicit-function-declaration
 )
 
+target_compile_definitions(RecompiledFuncs PRIVATE
+  osViSetXScale_recomp=sssv_osViSetXScale_recomp
+  osViSetYScale_recomp=sssv_osViSetYScale_recomp
+)
+
 target_include_directories(RecompiledFuncs PRIVATE
   "${CMAKE_SOURCE_DIR}/include"
   "${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/ultramodern/include"
@@ -240,6 +245,7 @@ target_sources(SSSVRecompiled PRIVATE
   "${CMAKE_SOURCE_DIR}/src/game/config.cpp"
   "${CMAKE_SOURCE_DIR}/src/game/recomp_api.cpp"
   "${CMAKE_SOURCE_DIR}/src/game/sssv_billboard_rewrite.cpp"
+  "${CMAKE_SOURCE_DIR}/src/game/vi_scale_workaround.cpp"
   "${CMAKE_SOURCE_DIR}/rsp/aspMain.cpp"
 )
 

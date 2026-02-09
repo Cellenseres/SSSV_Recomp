@@ -8,6 +8,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <cinttypes>
+#include <string>
 
 #include "nfd.h"
 
@@ -432,7 +433,15 @@ UnknownGBIFallback get_unknown_gbi_fallback(uint8_t* rdram, const OSTask* task, 
         return UnknownGBIFallback::F3DEX;
     }
 
+    if (ucode_name.find("F3DEX") != std::string::npos || ucode_name.find("F3D") != std::string::npos) {
+        return UnknownGBIFallback::F3DEX;
+    }
+
     if (ucode_name.find("S2D") != std::string::npos && ucode_name.find("S2DEX") == std::string::npos) {
+        return UnknownGBIFallback::S2DEX;
+    }
+
+    if (ucode_name.find("S2DEX") != std::string::npos) {
         return UnknownGBIFallback::S2DEX;
     }
 
@@ -520,6 +529,10 @@ private:
     UnknownGBIFallback active_fallback = UnknownGBIFallback::None;
 
     void maybe_apply_unknown_ucode_fallback(const OSTask* task) {
+        if (task == nullptr || task->t.type != M_GFXTASK) {
+            return;
+        }
+
         auto* rt64_context = dynamic_cast<recompui::renderer::RT64Context*>(inner.get());
         if (rt64_context == nullptr || rt64_context->app == nullptr) {
             return;
@@ -527,7 +540,12 @@ private:
 
         std::string ucode_name;
         UnknownGBIFallback fallback = get_unknown_gbi_fallback(rdram, task, &ucode_name);
-        if (fallback == UnknownGBIFallback::None || fallback == active_fallback) {
+        // Match the lib_modified behavior: default Unknown ucode path to F3DEX for SSSV.
+        if (fallback == UnknownGBIFallback::None) {
+            fallback = UnknownGBIFallback::F3DEX;
+        }
+
+        if (fallback == active_fallback) {
             return;
         }
 
@@ -535,7 +553,12 @@ private:
         active_fallback = fallback;
 
         const char* fallback_name = (fallback == UnknownGBIFallback::F3DEX) ? "F3DEX" : "S2DEX";
-        fprintf(stderr, "[SSSV] RT64 unknown ucode fallback -> %s for \"%s\"\n", fallback_name, ucode_name.c_str());
+        if (ucode_name.empty()) {
+            fprintf(stderr, "[SSSV] RT64 unknown ucode fallback -> %s (default)\n", fallback_name);
+        }
+        else {
+            fprintf(stderr, "[SSSV] RT64 unknown ucode fallback -> %s for \"%s\"\n", fallback_name, ucode_name.c_str());
+        }
     }
 };
 } // namespace
