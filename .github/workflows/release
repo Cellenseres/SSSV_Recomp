@@ -1,0 +1,244 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (e.g. 0.1.0)"
+        required: true
+      n64recomp_commit:
+        description: "N64Recomp commit override (optional)"
+        required: false
+        default: "81213c1831fab2521a6a5459c67b63437d67e253"
+
+permissions:
+  contents: write
+
+env:
+  N64RECOMP_COMMIT: ${{ inputs.n64recomp_commit }}
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x64
+          - os: windows-latest
+            platform: windows-x64
+          - os: macos-14
+            platform: macos-universal
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-sssv-release-${{ matrix.platform }}
+
+      - name: deps (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsdl2-dev libgtk-3-dev lld llvm clang gcc \
+            libx11-dev libxrandr-dev libfreetype-dev libvulkan-dev libfuse2
+
+      - name: deps (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install ninja -y
+          Remove-Item -Path "C:\ProgramData\Chocolatey\bin\ccache.exe" -Force -ErrorAction SilentlyContinue
+
+      - name: portable LLVM (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.3/LLVM-19.1.3-Windows-X64.tar.xz" -OutFile "LLVM.tar.xz"
+          New-Item -ItemType Directory -Path portable-llvm > $null
+          7z x LLVM.tar.xz
+          7z x LLVM.tar -oportable-llvm
+
+      - name: msvc devcmd (windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: deps (macos)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ninja
+          brew uninstall --ignore-dependencies libpng freetype
+
+      - name: macports (macos)
+        if: runner.os == 'macOS'
+        uses: melusina-org/setup-macports@v1
+        with:
+          parameters: '.github/macos/macports.yaml'
+
+      - name: macholib (macos)
+        if: runner.os == 'macOS'
+        run: pip3 install --break-system-packages macholib
+
+      - name: private content
+        uses: actions/checkout@v4
+        with:
+          repository: Cellenseres/SSSV_Recomp_PrivateContent
+          token: ${{ secrets.PRIVATE_CONTENT_TOKEN }}
+          path: sssv-private
+
+      - name: prepare rom
+        shell: bash
+        run: cp sssv-private/sssv.us.z64 ./
+
+      - name: build N64Recomp + RSPRecomp
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/Mr-Wiseguy/N64Recomp.git --recurse-submodules N64RecompSource
+          cd N64RecompSource
+          git checkout "${N64RECOMP_COMMIT}"
+          git submodule update --init --recursive
+
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cmake -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_C_COMPILER=clang-cl \
+              -DCMAKE_MAKE_PROGRAM=ninja -G Ninja -S . -B cmake-build \
+              -DCMAKE_CXX_FLAGS="-Xclang -fexceptions -Xclang -fcxx-exceptions"
+            cmake --build cmake-build --config Release --target N64RecompCLI
+            cmake --build cmake-build --config Release --target RSPRecomp
+            cp cmake-build/N64Recomp.exe ../
+            cp cmake-build/RSPRecomp.exe ../
+          else
+            cmake -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_MAKE_PROGRAM=ninja -G Ninja -S . -B cmake-build
+            cmake --build cmake-build --config Release --target N64RecompCLI
+            cmake --build cmake-build --config Release --target RSPRecomp
+            cp cmake-build/N64Recomp ../
+            cp cmake-build/RSPRecomp ../
+          fi
+
+      - name: run recompilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            ./N64Recomp.exe sssv.us.toml
+            ./RSPRecomp.exe aspMain.toml
+          else
+            ./N64Recomp sssv.us.toml
+            ./RSPRecomp aspMain.toml
+          fi
+
+      - name: build SSSVRecompiled
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            cmake -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang \
+              -DCMAKE_MAKE_PROGRAM=ninja -G Ninja -S . -B build-cmake
+            cmake --build build-cmake --config Release --target SSSVRecompiled
+
+          elif [[ "${{ runner.os }}" == "Windows" ]]; then
+            cpuCores=$(nproc 2>/dev/null || echo 4)
+            LLVMROOT="portable-llvm/LLVM-19.1.3-Windows-X64"
+
+            # avoid picking up system LLVM from choco
+            export PATH="$(echo "$PATH" | tr ':' '
+' | grep -v '/c/Program Files/LLVM/bin' | paste -sd ':' -)"
+
+            cmake -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_C_COMPILER=clang-cl \
+              -DCMAKE_MAKE_PROGRAM=ninja -G Ninja -S . -B build-cmake \
+              -DPATCHES_C_COMPILER="../${LLVMROOT}/bin/clang" \
+              -DPATCHES_LD="../${LLVMROOT}/bin/ld.lld" \
+              -DCMAKE_CXX_FLAGS="-Xclang -fexceptions -Xclang -fcxx-exceptions"
+            cmake --build build-cmake --config Release --target SSSVRecompiled -j "$cpuCores"
+
+          else
+            chmod +x .github/macos/ld64
+            cmake -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_MAKE_PROGRAM=ninja -G Ninja -S . -B build-cmake \
+              -DPATCHES_LD=/opt/local/bin/ld.lld-mp-18 \
+              -DCMAKE_AR=/opt/local/bin/llvm-ar-mp-18 \
+              -DPATCHES_C_COMPILER=/opt/local/bin/clang-mp-18 \
+              -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
+            cmake --build build-cmake --config Release --target SSSVRecompiled
+          fi
+
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist/package
+
+          cp -R assets dist/package/
+
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp build-cmake/SSSVRecompiled.exe dist/package/
+            cp build-cmake/dxcompiler.dll dist/package/ || true
+            cp build-cmake/dxil.dll dist/package/ || true
+            cp build-cmake/SDL2.dll dist/package/ || true
+            cp build-cmake/RecompiledFuncs.lib dist/package/ || true
+
+          else
+            cp build-cmake/SSSVRecompiled dist/package/SSSVRecompiled
+
+            # Optional runtime libs if your build drops them next to the binary
+            find build-cmake -maxdepth 1 -type f \( \
+              -name 'libSDL2*.so*' -o -name 'libvulkan*.so*' -o \
+              -name 'libSDL2*.dylib' -o -name 'libvulkan*.dylib' \
+            \) -exec cp {} dist/package/ \; || true
+          fi
+
+          rm -f dist/package/file_to_c* dist/package/texture_hasher* dist/package/texture_packer*
+
+          (cd dist/package && cmake -E tar cfv "../SSSVRecompiled-${{ matrix.platform }}-v${{ inputs.version }}.zip" --format=zip .)
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSSVRecompiled-${{ matrix.platform }}-v${{ inputs.version }}
+          path: dist/SSSVRecompiled-${{ matrix.platform }}-v${{ inputs.version }}.zip
+
+  release:
+    name: publish
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: SSSVRecompiled-*
+          path: artifacts
+
+      - name: collect zips
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+          find artifacts -type f -name '*.zip' -maxdepth 3 -print0 | xargs -0 -I{} cp {} release-files/
+          ls -la release-files
+
+      - name: create github release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: SSSVRecompiled v${{ inputs.version }}
+          generate_release_notes: true
+          files: release-files/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
