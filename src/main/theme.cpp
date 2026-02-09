@@ -91,7 +91,7 @@ void recomptheme::set_custom_theme() {
     theme::border::radius_lg = 24.0f;
 
     const uint32_t header_weight = 700;
-    const uint32_t label_weight = 500;
+    const uint32_t label_weight = 400;
     const uint32_t base_weight = 400;
     theme::set_typography_preset(theme::Typography::Header1, 68.0f, 0.01f, header_weight);
     theme::set_typography_preset(theme::Typography::Header2, 52.0f, 0.01f, header_weight);
