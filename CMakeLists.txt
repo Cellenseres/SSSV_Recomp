@@ -244,6 +244,7 @@ target_sources(SSSVRecompiled PRIVATE
   "${CMAKE_SOURCE_DIR}/src/main/launcher_animation.cpp"
   "${CMAKE_SOURCE_DIR}/src/game/config.cpp"
   "${CMAKE_SOURCE_DIR}/src/game/recomp_api.cpp"
+  "${CMAKE_SOURCE_DIR}/src/game/trophy_collision_patch.cpp"
   "${CMAKE_SOURCE_DIR}/src/game/sssv_billboard_rewrite.cpp"
   "${CMAKE_SOURCE_DIR}/src/game/vi_scale_workaround.cpp"
   "${CMAKE_SOURCE_DIR}/rsp/aspMain.cpp"

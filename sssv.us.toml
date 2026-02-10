@@ -20,6 +20,11 @@ text = "load_overlays(ctx->r4, ctx->r5, ctx->r6);"
 before_vram = 0x80129290
 
 [[patches.hook]]
+func = "func_802B75CC_6C8C7C"
+text = "sssv_patch_trophy_collision_guard(rdram, ctx);"
+before_vram = 0x802B75CC
+
+[[patches.hook]]
 func = "func_802E89F0_6FA0A0"
 text = "sssv_hook_lod_visibility(rdram, ctx);"
 before_vram = 0x802E89F0
