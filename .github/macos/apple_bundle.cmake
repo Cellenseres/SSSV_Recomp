@@ -15,24 +15,37 @@ set_target_properties(SSSVRecompiled PROPERTIES
 )
 
 # Create icon files for macOS bundle
-set(ICON_SOURCE ${CMAKE_SOURCE_DIR}/icons/app.png)
+set(ICON_SOURCE "")
+if(EXISTS "${CMAKE_SOURCE_DIR}/icons/app.png")
+    set(ICON_SOURCE "${CMAKE_SOURCE_DIR}/icons/app.png")
+elseif(EXISTS "${CMAKE_SOURCE_DIR}/icons/512.png")
+    set(ICON_SOURCE "${CMAKE_SOURCE_DIR}/icons/512.png")
+elseif(EXISTS "${CMAKE_SOURCE_DIR}/icons/source.png")
+    set(ICON_SOURCE "${CMAKE_SOURCE_DIR}/icons/source.png")
+else()
+    message(FATAL_ERROR "No macOS icon source found. Expected one of: icons/app.png, icons/512.png, icons/source.png")
+endif()
+
 set(ICONSET_DIR ${CMAKE_BINARY_DIR}/AppIcon.iconset)
+set(ICONSET_STAMP ${CMAKE_BINARY_DIR}/AppIcon.iconset.stamp)
 set(ICNS_FILE ${CMAKE_BINARY_DIR}/resources/AppIcon.icns)
 
 # Create iconset directory and add PNG file
 add_custom_command(
-        OUTPUT ${ICONSET_DIR}
+        OUTPUT ${ICONSET_STAMP}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${ICONSET_DIR}
         COMMAND ${CMAKE_COMMAND} -E copy ${ICON_SOURCE} ${ICONSET_DIR}/icon_512x512.png
         COMMAND ${CMAKE_COMMAND} -E copy ${ICON_SOURCE} ${ICONSET_DIR}/icon_512x512@2x.png
-        COMMAND touch ${ICONSET_DIR}
+        COMMAND ${CMAKE_COMMAND} -E touch ${ICONSET_STAMP}
+        DEPENDS ${ICON_SOURCE}
         COMMENT "Creating iconset directory and copying PNG file"
 )
 
 # Convert iconset to icns
 add_custom_command(
         OUTPUT ${ICNS_FILE}
-        DEPENDS ${ICONSET_DIR}
+        DEPENDS ${ICONSET_STAMP}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/resources
         COMMAND iconutil -c icns ${ICONSET_DIR} -o ${ICNS_FILE}
         COMMENT "Converting iconset to icns"
 )
