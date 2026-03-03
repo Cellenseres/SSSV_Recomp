@@ -94,7 +94,11 @@ Building is not required to play this project, as prebuilt binaries (which do no
 
 ## Libraries Used and Projects Referenced
 * [N64Recomp](https://github.com/N64Recomp/N64Recomp) for statically recompiling the game's code to run natively
-* [RT64](https://github.com/rt64/rt64) for the project's rendering engine
+* [RT64](https://github.com/rt64/rt64) as the project's rendering engine (via our fork with added S2DEX support, which Space Station Silicon Valley uses frequently for sprite/background rendering)
 * [N64ModernRuntime](https://github.com/N64Recomp/N64ModernRuntime) for replacing the original N64 runtime libraries and providing mod support
 * [RecompFrontend](https://github.com/N64Recomp/RecompFrontend) for menus and input handling
 * Space Station Silicon Valley decompilation project for headers and some function definitions, used for making patches or some enhancements
+
+#### What are F3DEX and S2DEX?
+F3DEX is a Fast3D "extended" RSP microcode/GBI used for the game's 3D display lists.  
+S2DEX is a sprite/background-focused RSP microcode/GBI designed for 2D rendering (sprites and BG operations). Space Station Silicon Valley uses S2DEX frequently, so we maintain a custom RT64 fork that adds S2DEX support.
