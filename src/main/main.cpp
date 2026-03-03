@@ -8,6 +8,8 @@
 #include <numeric>
 #include <stdexcept>
 #include <cinttypes>
+#include <string>
+#include <cstdlib>
 
 #include "nfd.h"
 
@@ -30,7 +32,9 @@
 
 #include "recompui/recompui.h"
 #include "recompui/program_config.h"
+#define private public
 #include "recompui/renderer.h"
+#undef private
 #include "recompui/config.h"
 #include "util/file.h"
 #include "recompinput/input_events.h"
@@ -46,6 +50,16 @@
 #include "cs_sdk/launcher_music.h"
 
 #ifdef _WIN32
+#include <unknwn.h>
+#include <objidl.h>
+#endif
+
+#include "hle/rt64_application.h"
+#include "gbi/rt64_gbi_rdp.h"
+#include "gbi/rt64_gbi_f3dex.h"
+#include "gbi/rt64_gbi_s2dex.h"
+
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <DbgHelp.h>
@@ -53,7 +67,7 @@
 #include "SDL_syswm.h"
 #endif
 
-const std::string version_string = "0.1.0";
+const std::string version_string = "0.1.2";
 
 template<typename... Ts>
 void exit_error(const char* str, Ts ...args) {
@@ -267,6 +281,16 @@ bool reset_audio(uint32_t output_freq) {
 }
 
 namespace {
+bool is_sssv_trace_ucode_enabled() {
+    static int cached_enabled = -1;
+    if (cached_enabled < 0) {
+        const char* env_value = std::getenv("SSSV_TRACE_UCODE");
+        cached_enabled = ((env_value != nullptr) && (env_value[0] == '1')) ? 1 : 0;
+    }
+
+    return (cached_enabled != 0);
+}
+
 bool ensure_launcher_audio_device() {
     if (launcher_audio_device != 0) {
         return true;
@@ -358,6 +382,217 @@ void shutdown_launcher_audio_device() {
     }
     launcher_audio_failed = false;
 }
+
+enum class UnknownGBIFallback {
+    None,
+    F3DEX,
+    S2DEX,
+};
+
+const char* unknown_gbi_fallback_name(UnknownGBIFallback fallback) {
+    switch (fallback) {
+    case UnknownGBIFallback::F3DEX:
+        return "F3DEX";
+    case UnknownGBIFallback::S2DEX:
+        return "S2DEX";
+    default:
+        return "None";
+    }
+}
+
+std::string read_ucode_name(uint8_t* rdram, uint32_t data_address) {
+    if (rdram == nullptr) {
+        return {};
+    }
+
+    constexpr uint32_t rdram_mask = 0x7FFFFF;
+    constexpr size_t read_size = 0x800;
+    std::array<uint8_t, read_size> data_segment{};
+
+    for (size_t i = 0; i < read_size; i++) {
+        uint32_t address = (data_address + static_cast<uint32_t>(i)) & rdram_mask;
+        data_segment[i] = rdram[address ^ 0x3];
+    }
+
+    const uint8_t rsp_pattern[] = "RSP";
+    auto* segment_begin = data_segment.data();
+    auto* segment_end = data_segment.data() + data_segment.size();
+    auto* pattern_begin = rsp_pattern;
+    auto* pattern_end = rsp_pattern + sizeof(rsp_pattern) - 1;
+    auto* search_result = std::search(segment_begin, segment_end, pattern_begin, pattern_end);
+    if (search_result == segment_end) {
+        return {};
+    }
+
+    size_t valid_chars = 0;
+    while ((search_result + valid_chars) < segment_end) {
+        uint8_t c = search_result[valid_chars];
+        if (c <= 0x0A || c > 0x7E) {
+            break;
+        }
+
+        valid_chars++;
+    }
+
+    if (valid_chars == 0) {
+        return {};
+    }
+
+    return std::string(reinterpret_cast<const char*>(search_result), valid_chars);
+}
+
+UnknownGBIFallback get_unknown_gbi_fallback(uint8_t* rdram, const OSTask* task, std::string* out_ucode_name) {
+    if (task == nullptr || task->t.type != M_GFXTASK) {
+        return UnknownGBIFallback::None;
+    }
+
+    std::string ucode_name = read_ucode_name(rdram, task->t.ucode_data & 0x3FFFFFF);
+    if (out_ucode_name != nullptr) {
+        *out_ucode_name = ucode_name;
+    }
+
+    if (ucode_name.find("F3DTEX/A") != std::string::npos) {
+        return UnknownGBIFallback::F3DEX;
+    }
+
+    if (ucode_name.find("F3DEX") != std::string::npos || ucode_name.find("F3D") != std::string::npos) {
+        return UnknownGBIFallback::F3DEX;
+    }
+
+    if (ucode_name.find("S2D") != std::string::npos && ucode_name.find("S2DEX") == std::string::npos) {
+        return UnknownGBIFallback::S2DEX;
+    }
+
+    if (ucode_name.find("S2DEX") != std::string::npos) {
+        return UnknownGBIFallback::S2DEX;
+    }
+
+    return UnknownGBIFallback::None;
+}
+
+void apply_unknown_gbi_fallback(RT64::Application* app, UnknownGBIFallback fallback) {
+    if (app == nullptr || app->interpreter == nullptr) {
+        return;
+    }
+
+    auto& unknown_gbi = app->interpreter->gbiManager.gbiCache[static_cast<uint32_t>(RT64::GBIUCode::Unknown)];
+    unknown_gbi = RT64::GBI{};
+
+    switch (fallback) {
+    case UnknownGBIFallback::F3DEX:
+        unknown_gbi.ucode = RT64::GBIUCode::F3DEX;
+        RT64::GBI_RDP::setup(&unknown_gbi, true);
+        RT64::GBI_F3DEX::setup(&unknown_gbi);
+        break;
+    case UnknownGBIFallback::S2DEX:
+        unknown_gbi.ucode = RT64::GBIUCode::S2DEX;
+        RT64::GBI_RDP::setup(&unknown_gbi, true);
+        RT64::GBI_S2DEX::setup(&unknown_gbi);
+        break;
+    case UnknownGBIFallback::None:
+    default:
+        break;
+    }
+}
+
+class RT64CompatContext final : public ultramodern::renderer::RendererContext {
+public:
+    RT64CompatContext(std::unique_ptr<ultramodern::renderer::RendererContext> inner_context, uint8_t* rdram)
+        : inner(std::move(inner_context)), rdram(rdram) {}
+
+    bool valid() override {
+        return inner != nullptr && inner->valid();
+    }
+
+    ultramodern::renderer::SetupResult get_setup_result() const override {
+        return inner->get_setup_result();
+    }
+
+    ultramodern::renderer::GraphicsApi get_chosen_api() const override {
+        return inner->get_chosen_api();
+    }
+
+    bool update_config(const ultramodern::renderer::GraphicsConfig& old_config, const ultramodern::renderer::GraphicsConfig& new_config) override {
+        return inner->update_config(old_config, new_config);
+    }
+
+    void enable_instant_present() override {
+        inner->enable_instant_present();
+    }
+
+    void send_dl(const OSTask* task) override {
+        maybe_apply_unknown_ucode_fallback(task);
+        inner->send_dl(task);
+    }
+
+    void send_dummy_workload(uint32_t fb_address) override {
+        inner->send_dummy_workload(fb_address);
+    }
+
+    void update_screen() override {
+        inner->update_screen();
+    }
+
+    void shutdown() override {
+        inner->shutdown();
+    }
+
+    uint32_t get_display_framerate() const override {
+        return inner->get_display_framerate();
+    }
+
+    float get_resolution_scale() const override {
+        return inner->get_resolution_scale();
+    }
+
+private:
+    std::unique_ptr<ultramodern::renderer::RendererContext> inner;
+    uint8_t* rdram = nullptr;
+    UnknownGBIFallback active_fallback = UnknownGBIFallback::None;
+
+    void maybe_apply_unknown_ucode_fallback(const OSTask* task) {
+        if (task == nullptr || task->t.type != M_GFXTASK) {
+            return;
+        }
+
+        auto* rt64_context = dynamic_cast<recompui::renderer::RT64Context*>(inner.get());
+        if (rt64_context == nullptr || rt64_context->app == nullptr) {
+            return;
+        }
+
+        std::string ucode_name;
+        UnknownGBIFallback fallback = get_unknown_gbi_fallback(rdram, task, &ucode_name);
+        // Match the lib_modified behavior: default Unknown ucode path to F3DEX for SSSV.
+        if (fallback == UnknownGBIFallback::None) {
+            fallback = UnknownGBIFallback::F3DEX;
+        }
+
+        if (is_sssv_trace_ucode_enabled()) {
+            fprintf(stderr,
+                "[SSSV][UCODE][TASK_FALLBACK] task_ucode=0x%08X task_ucode_data=0x%08X read_name=\"%s\" chosen=%s active_before=%s\n",
+                task->t.ucode & 0x3FFFFFF,
+                task->t.ucode_data & 0x3FFFFFF,
+                ucode_name.c_str(),
+                unknown_gbi_fallback_name(fallback),
+                unknown_gbi_fallback_name(active_fallback));
+        }
+
+        if (fallback == active_fallback) {
+            return;
+        }
+
+        apply_unknown_gbi_fallback(rt64_context->app.get(), fallback);
+        active_fallback = fallback;
+
+        const char* fallback_name = unknown_gbi_fallback_name(fallback);
+        if (ucode_name.empty()) {
+            fprintf(stderr, "[SSSV] RT64 unknown ucode fallback -> %s (default)\n", fallback_name);
+        }
+        else {
+            fprintf(stderr, "[SSSV] RT64 unknown ucode fallback -> %s for \"%s\"\n", fallback_name, ucode_name.c_str());
+        }
+    }
+};
 } // namespace
 
 // RSP microcode - SSSV uses audio RSP
@@ -656,7 +891,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Failed to load controller mappings: %s\n", SDL_GetError());
     }
 
-    recompui::register_primary_font("LDF-ComicSans.ttf", "Comic Sans");
+    recompui::register_primary_font("LDF-ComicSans.ttf", "LDFComicSans");
     recompui::register_extra_font("InterVariable.ttf");
 
     csdk::launcher_music::Config launcher_music_config{
@@ -689,6 +924,7 @@ int main(int argc, char** argv) {
 
     recomptheme::set_custom_theme();
 
+    sssv::register_patches();
     sssv::register_overlays();
 
     recompinput::players::set_single_player_mode(true);
@@ -703,9 +939,10 @@ int main(int argc, char** argv) {
     };
 
     ultramodern::renderer::callbacks_t renderer_callbacks{
-        .create_render_context = [](uint8_t* rdram, ultramodern::renderer::WindowHandle window_handle, bool developer_mode) {
+        .create_render_context = [](uint8_t* rdram, ultramodern::renderer::WindowHandle window_handle, bool developer_mode) -> std::unique_ptr<ultramodern::renderer::RendererContext> {
             auto presentation_mode = ultramodern::renderer::PresentationMode::PresentEarly;
-            return recompui::renderer::create_render_context(rdram, window_handle, presentation_mode, developer_mode);
+            auto inner_context = recompui::renderer::create_render_context(rdram, window_handle, presentation_mode, developer_mode);
+            return std::make_unique<RT64CompatContext>(std::move(inner_context), rdram);
         },
     };
 

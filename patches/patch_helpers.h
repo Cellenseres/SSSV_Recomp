@@ -8,17 +8,17 @@
 #endif
 
 #ifdef __cplusplus
-#define EXTERNC extern "C"
+#   define EXTERNC extern "C"
 #else
-#define EXTERNC
+#   define EXTERNC
 #endif
 
 #ifdef MIPS
-#define DECLARE_FUNC(type, name, ...) \
-    EXTERNC type name(__VA_ARGS__)
+#    define DECLARE_FUNC(type, name, ...) \
+        EXTERNC type name(__VA_ARGS__)
 #else
-#define DECLARE_FUNC(type, name, ...) \
-    EXTERNC void name(uint8_t* rdram, recomp_context* ctx)
+#    define DECLARE_FUNC(type, name, ...) \
+        EXTERNC void name(uint8_t* rdram, recomp_context* ctx)
 #endif
 
 #endif

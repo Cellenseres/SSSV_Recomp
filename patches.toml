@@ -1,0 +1,20 @@
+# Config file for recompiling SSSV patch ELF into RecompiledPatches output.
+
+[input]
+# Paths are relative to this config file.
+elf_path = "patches/patches.elf"
+output_func_path = "RecompiledPatches"
+single_file_output = true
+use_absolute_symbols = true
+
+# Resolve relocations against base game symbols.
+func_reference_syms_file = "SSSVRecompSyms/sssv.us.syms.toml"
+data_reference_syms_files = [ "SSSVRecompSyms/sssv.us.datasyms.toml" ]
+
+# Also emit the binary patch payload.
+output_binary_path = "patches/patches.bin"
+unpaired_lo16_warnings = false
+
+# Keep parity with other recomps' patch pipeline behavior.
+allow_exports = true
+strict_patch_mode = true

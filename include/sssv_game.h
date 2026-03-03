@@ -9,13 +9,14 @@
 #include "ultramodern/ultra64.h"
 
 namespace sssv {
-    // Called when the game initializes
     void on_init(uint8_t* rdram, recomp_context* ctx);
 
-    // Register all overlays
     void register_overlays();
 
-    // Get thread name for debugging
+    void register_patches();
+
+    void restore_runtime_patch_symbols();
+
     std::string get_game_thread_name(const OSThread* t);
 }
 

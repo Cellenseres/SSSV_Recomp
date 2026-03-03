@@ -1,7 +1,6 @@
 #ifndef __UI_FUNCS_H__
 #define __UI_FUNCS_H__
 
-// These three enums must be kept in sync with src/ui/elements/ui_types.h!
 typedef enum {
     UI_EVENT_NONE,
     UI_EVENT_CLICK,
@@ -9,7 +8,7 @@ typedef enum {
     UI_EVENT_HOVER,
     UI_EVENT_ENABLE,
     UI_EVENT_DRAG,
-    UI_EVENT_RESERVED1, // Would be UI_EVENT_TEXT but text events aren't usable in mods currently
+    UI_EVENT_RESERVED1,
     UI_EVENT_UPDATE,
     UI_EVENT_NAVIGATE,
     UI_EVENT_MOUSE_BUTTON,

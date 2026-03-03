@@ -1,0 +1,11 @@
+[input]
+elf_path = "@SSSV_PATCH_ELF_POSIX@"
+output_func_path = "@SSSV_RECOMPILED_PATCHES_DIR_POSIX@"
+single_file_output = true
+use_absolute_symbols = true
+func_reference_syms_file = "@SSSV_SYMS_FILE_POSIX@"
+data_reference_syms_files = [ "@SSSV_DATASYMS_FILE_POSIX@" ]
+output_binary_path = "@SSSV_PATCH_BIN_POSIX@"
+unpaired_lo16_warnings = false
+allow_exports = true
+strict_patch_mode = true

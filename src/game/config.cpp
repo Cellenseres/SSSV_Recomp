@@ -1,15 +1,10 @@
 #include "sssv_config.h"
 #include "sssv_game.h"
-#include "recompui/recompui.h"
 #include "recompui/config.h"
-#include "recompinput/recompinput.h"
-#include "ultramodern/config.hpp"
-#include "librecomp/files.hpp"
-#include "librecomp/config.hpp"
 #include "util/file.h"
+
 #include <filesystem>
-#include <fstream>
-#include <iomanip>
+#include <string>
 
 namespace sssv {
 
@@ -20,41 +15,30 @@ void init_config() {
         std::filesystem::create_directories(recomp_dir);
     }
 
-    // Create general options tab
     recompui::config::GeneralTabOptions general_options{};
     general_options.has_rumble_strength = true;
     general_options.has_gyro_sensitivity = false;
     general_options.has_mouse_sensitivity = false;
 
     recompui::config::create_general_tab(general_options);
-
-    // Create graphics tab
     recompui::config::create_graphics_tab();
-
-    // Create controls tab
     recompui::config::create_controls_tab();
-
-    // Create sound tab
     recompui::config::create_sound_tab();
-
-    // Create mods tab
     recompui::config::create_mods_tab();
-
-    // Finalize configuration
     recompui::config::finalize();
 }
-
 void on_init(uint8_t* rdram, recomp_context* ctx) {
-    // Called when the game initializes
-    // Add any SSSV-specific initialization here
     (void)rdram;
     (void)ctx;
+
+    // librecomp clears func_map during init_overlays(), so absolute 0x8Fxxxxxx patch
+    // bridge symbols must be restored here before the game starts executing.
+    restore_runtime_patch_symbols();
 }
 
 std::string get_game_thread_name(const OSThread* t) {
     std::string name = "[Game] ";
 
-    // SSSV thread naming based on thread ID/priority
     switch (t->id) {
         case 0:
             switch (t->priority) {
