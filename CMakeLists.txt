@@ -205,6 +205,22 @@ if(TARGET recompinput)
   endif()
 endif()
 
+# Ensure CellenseresSDK also sees SDL headers/libs.
+# This target is added before SDL setup, so we must attach SDL after discovery.
+if(TARGET cellenseres_sdk)
+  if(DEFINED SDL2_INCLUDE_DIRS)
+    target_include_directories(cellenseres_sdk PRIVATE ${SDL2_INCLUDE_DIRS})
+  elseif(DEFINED SDL2_INCLUDE_DIR)
+    target_include_directories(cellenseres_sdk PRIVATE ${SDL2_INCLUDE_DIR})
+  endif()
+
+  if(TARGET SDL2::SDL2)
+    target_link_libraries(cellenseres_sdk PRIVATE SDL2::SDL2)
+  elseif(DEFINED SDL2_LIBRARIES)
+    target_link_libraries(cellenseres_sdk PRIVATE ${SDL2_LIBRARIES})
+  endif()
+endif()
+
 # -----------------------------------------------------------------------------
 # Recompiled funcs library
 # -----------------------------------------------------------------------------
