@@ -146,16 +146,25 @@ bool configure_title_intro_model() {
         cfg.target_transform.scale = { 0.620f, 0.620f, 0.620f };
 
         cfg.light.direction_ws = { -0.200f, -0.800f, -0.500f };
-        cfg.light.position_ws = { 0.050f, 0.250f, 7.600f };
-        cfg.light.range = 22.300f;
+        cfg.light.position_ws = { -1.100f, 0.990f, 4.670f };
+        cfg.light.range = 21.400f;
         cfg.light.color = { 0.870f, 0.890f, 1.330f };
         cfg.light.intensity = 1.690f;
-        cfg.light.ambient_intensity = 0.530f;
+        cfg.light.ambient_intensity = 0.310f;
 
         cfg.intro.duration_sec = 1.780f;
         cfg.intro.overshoot = 0.290f;
         cfg.intro.damping = 7.250f;
         cfg.intro.play_once = true;
+        cfg.shadow.enabled = true;
+        cfg.shadow.mode = csdk::launcher3d::ShadowMode::PointCubePreferred;
+        cfg.shadow.resolution = 2048;
+        cfg.shadow.strength = 0.840f;
+        cfg.shadow.depth_bias = 0.002f;
+        cfg.shadow.normal_bias = 0.049f;
+        cfg.shadow.softness = 2.360f;
+        cfg.shadow.near_plane = 0.190f;
+        cfg.shadow.far_plane_override = 7.400f;
         cfg.visible_only_on_title_screen = true;
         return cfg;
     };

@@ -9,6 +9,9 @@ cbuffer SceneCB : register(b0) {
     float4 camera_pos_spec_factor;
     float4 base_color_factor;
     float4 spec_color_factor;
+    float4 shadow_params0;
+    float4 shadow_params1;
+    float4x4 shadow_view_proj[6];
 };
 
 struct VSInput {

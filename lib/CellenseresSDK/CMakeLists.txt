@@ -85,3 +85,5 @@ endif()
 
 build_vertex_shader(cellenseres_sdk "lib/CellenseresSDK/shaders/LauncherModelVS.hlsl" "shaders/LauncherModelVS.hlsl")
 build_pixel_shader(cellenseres_sdk "lib/CellenseresSDK/shaders/LauncherModelPS.hlsl" "shaders/LauncherModelPS.hlsl")
+build_vertex_shader(cellenseres_sdk "lib/CellenseresSDK/shaders/LauncherShadowVS.hlsl" "shaders/LauncherShadowVS.hlsl")
+build_pixel_shader(cellenseres_sdk "lib/CellenseresSDK/shaders/LauncherShadowPS.hlsl" "shaders/LauncherShadowPS.hlsl")

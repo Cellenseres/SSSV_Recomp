@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 
@@ -8,6 +9,12 @@ namespace recompui {
 }
 
 namespace csdk::launcher3d {
+    enum class ShadowMode {
+        Disabled,
+        PointCubePreferred,
+        SpotOnly,
+    };
+
     struct Vec3 {
         float x = 0.0f;
         float y = 0.0f;
@@ -42,11 +49,24 @@ namespace csdk::launcher3d {
         bool play_once = true;
     };
 
+    struct ShadowConfig {
+        bool enabled = true;
+        ShadowMode mode = ShadowMode::PointCubePreferred;
+        uint32_t resolution = 2048;
+        float strength = 0.88f;
+        float depth_bias = 0.0012f;
+        float normal_bias = 0.02f;
+        float softness = 1.25f;
+        float near_plane = 0.05f;
+        float far_plane_override = 0.0f;
+    };
+
     struct Config {
         std::filesystem::path glb_path{};
         Transform target_transform{};
         Light light{};
         IntroAnimation intro{};
+        ShadowConfig shadow{};
         bool visible_only_on_title_screen = true;
     };
 

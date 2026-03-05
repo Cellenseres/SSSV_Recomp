@@ -49,12 +49,18 @@
 
 #include "LauncherModelVS.hlsl.spirv.h"
 #include "LauncherModelPS.hlsl.spirv.h"
+#include "LauncherShadowVS.hlsl.spirv.h"
+#include "LauncherShadowPS.hlsl.spirv.h"
 #ifdef _WIN32
 #include "LauncherModelVS.hlsl.dxil.h"
 #include "LauncherModelPS.hlsl.dxil.h"
+#include "LauncherShadowVS.hlsl.dxil.h"
+#include "LauncherShadowPS.hlsl.dxil.h"
 #elif defined(__APPLE__)
 #include "LauncherModelVS.hlsl.metal.h"
 #include "LauncherModelPS.hlsl.metal.h"
+#include "LauncherShadowVS.hlsl.metal.h"
+#include "LauncherShadowPS.hlsl.metal.h"
 #endif
 
 #ifdef _WIN32
@@ -83,7 +89,6 @@ namespace recompui {
     }
 }
 
-// Keep launcher_model3d.cpp decoupled from SDL headers for CI portability.
 extern "C" int SDL_SetClipboardText(const char* text);
 
 namespace csdk::launcher3d {
@@ -94,6 +99,13 @@ constexpr float kCameraZ = 2.7f;
 constexpr float kSpawnDepthDistance = 6.0f;
 constexpr float kSpawnScaleMul = 0.08f;
 constexpr float kMinRenderableScale = 0.001f;
+constexpr plume::RenderFormat kShadowColorFormat = plume::RenderFormat::R32_FLOAT;
+constexpr uint32_t kShadowFaceCount = 6;
+constexpr float kShadowNearPlaneMin = 0.01f;
+constexpr float kShadowFarPlaneMin = 0.10f;
+constexpr float kDebugLightMarkerRadius = 0.085f;
+constexpr uint32_t kDebugLightMarkerSlices = 32;
+constexpr uint32_t kDebugLightMarkerStacks = 20;
 
 struct V2 { float x, y; };
 struct V3 { float x, y, z; };
@@ -121,6 +133,10 @@ struct CpuModel {
     bool flipped_winding = false;
     bool had_owner_node = false;
     float owner_node_det3 = 1.0f;
+    V3 bounds_min{ 0.0f, 0.0f, 0.0f };
+    V3 bounds_max{ 0.0f, 0.0f, 0.0f };
+    V3 bounds_center{ 0.0f, 0.0f, 0.0f };
+    float bounds_radius = 1.0f;
 };
 
 struct Constants {
@@ -132,24 +148,68 @@ struct Constants {
     V4 camera_spec{};
     V4 base_color{};
     V4 spec_color{};
+    V4 shadow_params0{};
+    V4 shadow_params1{};
+    M4 shadow_view_proj[6]{};
+};
+
+struct ShadowPassConstants {
+    M4 model{};
+    M4 light_view_proj{};
+    V4 light_pos_far{};
+};
+
+enum class ActiveShadowMode {
+    Disabled = 0,
+    PointAtlas = 1,
+    Spot = 2,
+};
+
+struct ShadowRuntime {
+    ActiveShadowMode active_mode = ActiveShadowMode::Disabled;
+    uint32_t effective_resolution = 0;
+    bool dirty = true;
+    bool has_signature = false;
+    bool resources_ready = false;
+    uint64_t render_count = 0;
+    std::string fallback_reason{};
+    Transform last_transform{};
+    Light last_light{};
+    ShadowConfig last_shadow_cfg{};
 };
 
 struct Gpu {
     plume::RenderInterface* rhi = nullptr;
     plume::RenderDevice* dev = nullptr;
     std::unique_ptr<plume::RenderSampler> sampler;
+    std::unique_ptr<plume::RenderSampler> shadow_sampler;
     std::unique_ptr<plume::RenderShader> vs;
     std::unique_ptr<plume::RenderShader> ps;
+    std::unique_ptr<plume::RenderShader> shadow_vs;
+    std::unique_ptr<plume::RenderShader> shadow_ps;
     std::unique_ptr<plume::RenderPipelineLayout> layout;
     std::unique_ptr<plume::RenderPipeline> pipeline;
+    std::unique_ptr<plume::RenderPipelineLayout> shadow_layout;
+    std::unique_ptr<plume::RenderPipeline> shadow_pipeline;
     std::unique_ptr<plume::RenderDescriptorSetBuilder> set_builder;
     std::unique_ptr<plume::RenderDescriptorSet> set;
+    std::unique_ptr<plume::RenderDescriptorSet> marker_set;
+    std::unique_ptr<plume::RenderDescriptorSetBuilder> shadow_set_builder;
+    std::unique_ptr<plume::RenderDescriptorSet> shadow_set;
     std::unique_ptr<plume::RenderBuffer> vb;
     std::unique_ptr<plume::RenderBuffer> ib;
+    std::unique_ptr<plume::RenderBuffer> marker_vb;
+    std::unique_ptr<plume::RenderBuffer> marker_ib;
     std::unique_ptr<plume::RenderBuffer> cb;
+    std::unique_ptr<plume::RenderBuffer> marker_cb;
+    std::unique_ptr<plume::RenderBuffer> shadow_cb;
     std::unique_ptr<plume::RenderTexture> tex_albedo;
     std::unique_ptr<plume::RenderTexture> tex_normal;
     std::unique_ptr<plume::RenderTexture> tex_spec;
+    std::unique_ptr<plume::RenderTexture> tex_shadow;
+    std::unique_ptr<plume::RenderTexture> tex_shadow_depth;
+    std::unique_ptr<plume::RenderFramebuffer> shadow_fb;
+    std::unique_ptr<plume::RenderTexture> tex_shadow_fallback;
     std::unique_ptr<plume::RenderCommandQueue> copy_q;
     std::unique_ptr<plume::RenderCommandList> copy_l;
     std::unique_ptr<plume::RenderCommandFence> copy_f;
@@ -161,11 +221,21 @@ struct Gpu {
     uint32_t a_idx = 0;
     uint32_t n_idx = 0;
     uint32_t s_idx = 0;
+    uint32_t shadow_idx = 0;
+    uint32_t shadow_cb_idx = 0;
     uint64_t cb_size = 0;
+    uint64_t marker_cb_size = 0;
+    uint64_t shadow_cb_size = 0;
+    uint64_t marker_vb_size = 0;
+    uint64_t marker_ib_size = 0;
     size_t index_count = 0;
+    size_t marker_index_count = 0;
     plume::RenderFormat pipeline_depth_format = plume::RenderFormat::UNKNOWN;
+    plume::RenderFormat shadow_pipeline_depth_format = plume::RenderFormat::UNKNOWN;
     bool pipeline_uses_depth = false;
     bool pipeline_ok = false;
+    bool shadow_pipeline_ok = false;
+    bool shadow_pipeline_unavailable = false;
     bool ready = false;
 };
 
@@ -182,6 +252,20 @@ struct DebugPanel {
     float drag_start_mouse_y = 0.0f;
     float drag_start_left_dp = 24.0f;
     float drag_start_top_dp = 24.0f;
+    bool show_light_marker = true;
+    float light_marker_scale = 1.0f;
+    bool free_camera_enabled = false;
+    float camera_yaw_deg = 0.0f;
+    float camera_pitch_deg = 0.0f;
+    float camera_distance = kCameraZ;
+    float camera_fov_deg = 55.0f;
+    float camera_target_x = 0.0f;
+    float camera_target_y = 0.0f;
+    float camera_target_z = 0.0f;
+    float camera_drag_start_x = 0.0f;
+    float camera_drag_start_y = 0.0f;
+    float camera_drag_start_yaw = 0.0f;
+    float camera_drag_start_pitch = 0.0f;
 #endif
 };
 
@@ -206,6 +290,7 @@ struct State {
     bool last_draw_attempted = false;
     bool pipeline_diag_reported = false;
     std::string pipeline_diag{};
+    ShadowRuntime shadow{};
     bool trace_enabled = true;
     uint64_t trace_install_calls = 0;
     uint64_t trace_init_calls = 0;
@@ -292,446 +377,64 @@ const void* ptr_addr(T* ptr) {
 #define LAUNCHER3D_TRACE(...) do {} while (0)
 #endif
 
-M4 I() {
-    M4 o{};
-    o.m[0] = 1.0f;
-    o.m[5] = 1.0f;
-    o.m[10] = 1.0f;
-    o.m[15] = 1.0f;
-    return o;
-}
-
-M4 Mul(const M4& a, const M4& b) {
-    M4 o{};
-    for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 4; c++) {
-            o.m[r * 4 + c] =
-                a.m[r * 4 + 0] * b.m[0 * 4 + c] +
-                a.m[r * 4 + 1] * b.m[1 * 4 + c] +
-                a.m[r * 4 + 2] * b.m[2 * 4 + c] +
-                a.m[r * 4 + 3] * b.m[3 * 4 + c];
-        }
-    }
-    return o;
-}
-
-M4 T(float x, float y, float z) {
-    M4 o = I();
-    o.m[12] = x;
-    o.m[13] = y;
-    o.m[14] = z;
-    return o;
-}
-
-M4 S(float x, float y, float z) {
-    M4 o = I();
-    o.m[0] = x;
-    o.m[5] = y;
-    o.m[10] = z;
-    return o;
-}
-
-M4 Rx(float a) {
-    M4 o = I();
-    const float c = std::cos(a);
-    const float s = std::sin(a);
-    o.m[5] = c;
-    o.m[6] = s;
-    o.m[9] = -s;
-    o.m[10] = c;
-    return o;
-}
-
-M4 Ry(float a) {
-    M4 o = I();
-    const float c = std::cos(a);
-    const float s = std::sin(a);
-    o.m[0] = c;
-    o.m[2] = -s;
-    o.m[8] = s;
-    o.m[10] = c;
-    return o;
-}
-
-M4 Rz(float a) {
-    M4 o = I();
-    const float c = std::cos(a);
-    const float s = std::sin(a);
-    o.m[0] = c;
-    o.m[1] = s;
-    o.m[4] = -s;
-    o.m[5] = c;
-    return o;
-}
-
-M4 TRS(const Transform& t) {
-    const float d2r = std::numbers::pi_v<float> / 180.0f;
-    const M4 model_translate = T(t.position.x, t.position.y, t.position.z);
-    const M4 model_rotate_z = Rz(t.rotation_deg.roll * d2r);
-    const M4 model_rotate_y = Ry(t.rotation_deg.yaw * d2r);
-    const M4 model_rotate_x = Rx(t.rotation_deg.pitch * d2r);
-    const M4 model_scale = S(t.scale.x, t.scale.y, t.scale.z);
-    return Mul(Mul(Mul(Mul(model_translate, model_rotate_z), model_rotate_y), model_rotate_x), model_scale);
-}
-
-M4 P(float fovy, float asp, float n, float f) {
-    // Right-handed projection for row-vector math (world * view * proj).
-    M4 o{};
-    const float q = 1.0f / std::tan(fovy * 0.5f);
-    o.m[0] = q / asp;
-    o.m[5] = q;
-    o.m[10] = f / (n - f);
-    o.m[11] = -1.0f;
-    o.m[14] = (n * f) / (n - f);
-    return o;
-}
-
-V3 sub(V3 a, V3 b) {
-    return { a.x - b.x, a.y - b.y, a.z - b.z };
-}
-
-V3 cross(V3 a, V3 b) {
-    return {
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x
-    };
-}
-
-float dot(V3 a, V3 b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-V4 mul_row_vec(V4 v, const M4& m){
-    return {
-        v.x * m.m[0]  + v.y * m.m[4]  + v.z * m.m[8]  + v.w * m.m[12],
-        v.x * m.m[1]  + v.y * m.m[5]  + v.z * m.m[9]  + v.w * m.m[13],
-        v.x * m.m[2]  + v.y * m.m[6]  + v.z * m.m[10] + v.w * m.m[14],
-        v.x * m.m[3]  + v.y * m.m[7]  + v.z * m.m[11] + v.w * m.m[15]
-    };
-}
-
-V3 norm(V3 v) {
-    const float len = std::sqrt(std::max(dot(v, v), 1e-12f));
-    return { v.x / len, v.y / len, v.z / len };
-}
-
-V3 intro_spawn_center_depth(const Transform& target) {
-    const V3 cam{ 0.0f, 0.0f, kCameraZ };
-    const V3 center_target{ 0.0f, 0.0f, target.position.z };
-    const V3 away_from_camera = norm(sub(center_target, cam));
-    return {
-        center_target.x + away_from_camera.x * kSpawnDepthDistance,
-        center_target.y + away_from_camera.y * kSpawnDepthDistance,
-        center_target.z + away_from_camera.z * kSpawnDepthDistance
-    };
-}
-
-M4 LookAt(V3 e, V3 t, V3 up){
-    // Right-handed camera basis to avoid mirrored X in clip space.
-    const V3 z = norm(sub(e, t));
-    const V3 x = norm(cross(up, z));
-    const V3 y = cross(z, x);
-
-    M4 o = I();
-    o.m[0] = x.x;
-    o.m[1] = y.x;
-    o.m[2] = z.x;
-    o.m[4] = x.y;
-    o.m[5] = y.y;
-    o.m[6] = z.y;
-    o.m[8] = x.z;
-    o.m[9] = y.z;
-    o.m[10] = z.z;
-    o.m[12] = -dot(x, e);
-    o.m[13] = -dot(y, e);
-    o.m[14] = -dot(z, e);
-    return o;
-}
-
-float clamp01(float v) {
-    return std::clamp(v, 0.0f, 1.0f);
-}
-
-float lerp(float a, float b, float t) {
-    return a + (b - a) * t;
-}
-
-uint64_t align_up_u64(uint64_t value, uint64_t alignment) {
-    if (alignment == 0) {
-        return value;
-    }
-
-    return ((value + alignment - 1) / alignment) * alignment;
-}
-
-float ease_intro(float t, float overs, float damping) {
-    const float s_back = 1.0f + 1.70158f * (0.35f + overs);
-    const float u = t - 1.0f;
-    float v = 1.0f + s_back * u * u * u + (s_back - 1.0f) * u * u;
-    v += std::exp(-damping * t) * std::sin(t * std::numbers::pi_v<float> * 2.0f) * overs * 0.08f;
-    return v;
-}
-
-bool read_file(const std::filesystem::path& p, std::vector<uint8_t>& out) {
-    std::ifstream f(p, std::ios::binary);
-    if (!f) {
-        return false;
-    }
-
-    f.seekg(0, std::ios::end);
-    const std::streamoff size = f.tellg();
-    if (size <= 0) {
-        return false;
-    }
-
-    f.seekg(0, std::ios::beg);
-    out.resize(static_cast<size_t>(size));
-    f.read(reinterpret_cast<char*>(out.data()), size);
-    return f.good();
-}
-
-const cgltf_accessor* find_attr(const cgltf_primitive& pr, cgltf_attribute_type ty, int idx = 0) {
-    for (cgltf_size i = 0; i < pr.attributes_count; i++) {
-        const auto& a = pr.attributes[i];
-        if (a.type == ty && a.index == idx) {
-            return a.data;
-        }
-    }
-
-    return nullptr;
-}
-
-bool image_bytes(const cgltf_image* img, const std::filesystem::path& dir, std::vector<uint8_t>& out) {
-    if (!img) {
-        return false;
-    }
-
-    if (img->buffer_view) {
-        const auto* view = img->buffer_view;
-        const uint8_t* p = view->data
-            ? reinterpret_cast<const uint8_t*>(view->data)
-            : ((view->buffer && view->buffer->data) ? (reinterpret_cast<const uint8_t*>(view->buffer->data) + view->offset) : nullptr);
-        if (!p || view->size == 0) {
-            return false;
-        }
-
-        out.assign(p, p + view->size);
-        return true;
-    }
-
-    if (!img->uri) {
-        return false;
-    }
-
-    std::string uri = img->uri;
-    if (uri.rfind("data:", 0) == 0) {
-        const size_t pos = uri.find("base64,");
-        if (pos == std::string::npos) {
-            return false;
-        }
-
-        const char* b64 = uri.c_str() + pos + 7;
-        const size_t n = std::strlen(b64);
-        const size_t pad = (n && b64[n - 1] == '=') + (n > 1 && b64[n - 2] == '=');
-        const cgltf_size out_n = (n / 4) * 3 - pad;
-
-        void* decoded = nullptr;
-        cgltf_options options{};
-        if (cgltf_load_buffer_base64(&options, out_n, b64, &decoded) != cgltf_result_success || decoded == nullptr) {
-            return false;
-        }
-
-        out.assign(reinterpret_cast<uint8_t*>(decoded), reinterpret_cast<uint8_t*>(decoded) + out_n);
-        std::free(decoded);
-        return true;
-    }
-
-    std::vector<char> mutable_uri(uri.begin(), uri.end());
-    mutable_uri.push_back('\0');
-    cgltf_decode_uri(mutable_uri.data());
-    return read_file(dir / mutable_uri.data(), out);
-}
-
-bool tex_bytes(const cgltf_texture_view& tv, const std::filesystem::path& dir, std::vector<uint8_t>& out) {
-    return tv.texture && tv.texture->image && image_bytes(tv.texture->image, dir, out);
-}
-
-bool load_glb(const std::filesystem::path& p,CpuModel& out,std::string& err){
-    cgltf_options o{}; cgltf_data* d=nullptr;
-    if(cgltf_parse_file(&o,p.string().c_str(),&d)!=cgltf_result_success||!d){ err="parse failed"; return false; }
-    auto fin=[&](){ if(d) cgltf_free(d); d=nullptr; };
-    if(cgltf_load_buffers(&o,d,p.string().c_str())!=cgltf_result_success){ err="load buffers failed"; fin(); return false; }
-
-    const cgltf_primitive* pr=nullptr;
-    const cgltf_node* owner_node=nullptr;
-    for(cgltf_size n=0;n<d->nodes_count&&!pr;n++){
-        const cgltf_node& node=d->nodes[n];
-        if(node.mesh==nullptr) continue;
-        for(cgltf_size i=0;i<node.mesh->primitives_count;i++){
-            const cgltf_primitive& c=node.mesh->primitives[i];
-            if(c.type==cgltf_primitive_type_triangles && find_attr(c,cgltf_attribute_type_position)){
-                pr=&c;
-                owner_node=&node;
-                break;
-            }
-        }
-    }
-    if(!pr){
-        for(cgltf_size m=0;m<d->meshes_count&&!pr;m++){
-            for(cgltf_size i=0;i<d->meshes[m].primitives_count;i++){
-                const cgltf_primitive& c=d->meshes[m].primitives[i];
-                if(c.type==cgltf_primitive_type_triangles && find_attr(c,cgltf_attribute_type_position)){
-                    pr=&c;
-                    break;
-                }
-            }
-        }
-    }
-    if(!pr){ err="no triangle primitive"; fin(); return false; }
-
-    auto* pa = find_attr(*pr, cgltf_attribute_type_position);
-    auto* na = find_attr(*pr, cgltf_attribute_type_normal);
-    auto* ta = find_attr(*pr, cgltf_attribute_type_tangent);
-    auto* ua = find_attr(*pr, cgltf_attribute_type_texcoord, 0);
-    if(!pa||pa->count==0){ err="no positions"; fin(); return false; }
-
-    M4 node_transform=I();
-    if(owner_node!=nullptr){
-        cgltf_float world_col_major[16]{};
-        cgltf_node_transform_world(owner_node, world_col_major);
-        for(int i=0;i<16;i++){
-            node_transform.m[i]=(float)world_col_major[i];
-        }
-    }
-
-    auto transform_pos = [&](const V3& p3)->V3{
-        V4 v = mul_row_vec({p3.x,p3.y,p3.z,1.0f}, node_transform);
-        return {v.x,v.y,v.z};
-    };
-    auto transform_dir = [&](const V3& d3)->V3{
-        V4 v = mul_row_vec({d3.x,d3.y,d3.z,0.0f}, node_transform);
-        return norm({v.x,v.y,v.z});
-    };
-
-    const float m00=node_transform.m[0], m01=node_transform.m[1], m02=node_transform.m[2];
-    const float m10=node_transform.m[4], m11=node_transform.m[5], m12=node_transform.m[6];
-    const float m20=node_transform.m[8], m21=node_transform.m[9], m22=node_transform.m[10];
-    const float det3 =
-        m00*(m11*m22 - m12*m21) -
-        m01*(m10*m22 - m12*m20) +
-        m02*(m10*m21 - m11*m20);
-    const bool flip_winding = det3 < 0.0f;
-    out.had_owner_node = (owner_node != nullptr);
-    out.owner_node_det3 = det3;
-    out.flipped_winding = flip_winding;
-    out.source_had_normals = (na != nullptr);
-
-    size_t vc=(size_t)pa->count; out.vertices.resize(vc); std::array<float,4> v{};
-    for(size_t i=0;i<vc;i++){
-        cgltf_accessor_read_float(pa,i,v.data(),3);
-        out.vertices[i].p=transform_pos({v[0],v[1],v[2]});
-        if(na){
-            cgltf_accessor_read_float(na,i,v.data(),3);
-            out.vertices[i].n=transform_dir({v[0],v[1],v[2]});
-        }
-        if(ta){
-            cgltf_accessor_read_float(ta,i,v.data(),4);
-            V3 t_dir = transform_dir({v[0],v[1],v[2]});
-            out.vertices[i].t={t_dir.x,t_dir.y,t_dir.z,v[3]};
-        }
-        if(ua){ cgltf_accessor_read_float(ua,i,v.data(),2); out.vertices[i].uv={v[0],v[1]}; }
-    }
-    if(pr->indices && pr->indices->count){
-        out.indices.resize((size_t)pr->indices->count);
-        for(size_t i=0;i<out.indices.size();i++) out.indices[i]=(uint32_t)cgltf_accessor_read_index(pr->indices,i);
-    }
-    else {
-        out.indices.resize(vc);
-        for(size_t i=0;i<vc;i++) out.indices[i]=(uint32_t)i;
-    }
-
-    if(flip_winding){
-        for(size_t i=0;i+2<out.indices.size();i+=3){
-            std::swap(out.indices[i+1], out.indices[i+2]);
-        }
-    }
-
-    if(!na){
-        std::vector<V3> accum(vc, V3{0.0f,0.0f,0.0f});
-        for(size_t i=0;i+2<out.indices.size();i+=3){
-            uint32_t i0=out.indices[i+0], i1=out.indices[i+1], i2=out.indices[i+2];
-            if(i0>=vc || i1>=vc || i2>=vc) continue;
-            V3 p0=out.vertices[i0].p, p1=out.vertices[i1].p, p2=out.vertices[i2].p;
-            V3 e1=sub(p1,p0), e2=sub(p2,p0);
-            V3 fn=cross(e1,e2);
-            accum[i0]={accum[i0].x+fn.x,accum[i0].y+fn.y,accum[i0].z+fn.z};
-            accum[i1]={accum[i1].x+fn.x,accum[i1].y+fn.y,accum[i1].z+fn.z};
-            accum[i2]={accum[i2].x+fn.x,accum[i2].y+fn.y,accum[i2].z+fn.z};
-        }
-        for(size_t i=0;i<vc;i++){
-            const float len2 = dot(accum[i],accum[i]);
-            out.vertices[i].n = (len2 > 1e-12f) ? norm(accum[i]) : V3{0.0f,0.0f,1.0f};
-        }
-        out.generated_smooth_normals = true;
-    }
-
-    if(pr->material){
-        const auto* m=pr->material;
-        if(m->has_pbr_metallic_roughness){
-            out.base_color = {
-                m->pbr_metallic_roughness.base_color_factor[0],
-                m->pbr_metallic_roughness.base_color_factor[1],
-                m->pbr_metallic_roughness.base_color_factor[2],
-                m->pbr_metallic_roughness.base_color_factor[3]
-            };
-            tex_bytes(m->pbr_metallic_roughness.base_color_texture, p.parent_path(), out.albedo);
-        }
-        tex_bytes(m->normal_texture, p.parent_path(), out.normal);
-        if(m->has_specular){
-            out.spec_factor = m->specular.specular_factor;
-            out.spec_color = {
-                m->specular.specular_color_factor[0],
-                m->specular.specular_color_factor[1],
-                m->specular.specular_color_factor[2],
-                1.0f
-            };
-            if(!tex_bytes(m->specular.specular_color_texture, p.parent_path(), out.spec)) {
-                tex_bytes(m->specular.specular_texture, p.parent_path(), out.spec);
-            }
-        }
-    }
-    fin(); return true;
-}
+#include "launcher_model3d_math.inl"
+#include "launcher_model3d_asset.inl"
 
 void clear_gpu(State& s){
     s.gpu.set.reset();
+    s.gpu.marker_set.reset();
+    s.gpu.shadow_set.reset();
     s.gpu.vb.reset();
     s.gpu.ib.reset();
+    s.gpu.marker_vb.reset();
+    s.gpu.marker_ib.reset();
     s.gpu.cb.reset();
+    s.gpu.marker_cb.reset();
+    s.gpu.shadow_cb.reset();
     s.gpu.tex_albedo.reset();
     s.gpu.tex_normal.reset();
     s.gpu.tex_spec.reset();
+    s.gpu.tex_shadow.reset();
+    s.gpu.tex_shadow_depth.reset();
+    s.gpu.shadow_fb.reset();
+    s.gpu.tex_shadow_fallback.reset();
     s.gpu.upload.reset();
     s.gpu.depth_by_src_fb.clear();
     s.gpu.fb_with_depth_by_src_fb.clear();
     s.gpu.pipeline_depth_format = plume::RenderFormat::UNKNOWN;
+    s.gpu.shadow_pipeline_depth_format = plume::RenderFormat::UNKNOWN;
     s.gpu.pipeline_uses_depth = false;
     s.gpu.ready=false;
     s.gpu.index_count=0;
+    s.gpu.marker_vb_size = 0;
+    s.gpu.marker_ib_size = 0;
+    s.gpu.marker_index_count=0;
+    s.gpu.marker_cb_size = 0;
+    s.shadow.resources_ready = false;
+    s.shadow.has_signature = false;
+    s.shadow.dirty = true;
+    s.shadow.active_mode = ActiveShadowMode::Disabled;
 }
 void clear_pipeline(State& s) {
     clear_gpu(s);
     s.gpu.pipeline.reset();
+    s.gpu.shadow_pipeline.reset();
     s.gpu.layout.reset();
+    s.gpu.shadow_layout.reset();
     s.gpu.vs.reset();
     s.gpu.ps.reset();
+    s.gpu.shadow_vs.reset();
+    s.gpu.shadow_ps.reset();
     s.gpu.sampler.reset();
+    s.gpu.shadow_sampler.reset();
     s.gpu.set_builder.reset();
+    s.gpu.shadow_set_builder.reset();
     s.gpu.copy_l.reset();
     s.gpu.copy_q.reset();
     s.gpu.copy_f.reset();
     s.gpu.pipeline_ok = false;
+    s.gpu.shadow_pipeline_ok = false;
+    s.gpu.shadow_pipeline_unavailable = false;
     s.pipeline_diag_reported = false;
     s.pipeline_diag.clear();
 }
@@ -780,7 +483,7 @@ std::unique_ptr<plume::RenderTexture> tex_file(
 }
 
 bool ensure_pipeline(State& s){
-    if(s.gpu.pipeline_ok) return true;
+    if (s.gpu.pipeline_ok && (s.gpu.shadow_pipeline_ok || s.gpu.shadow_pipeline_unavailable)) return true;
     s.trace_pipeline_attempts++;
     if(!s.gpu.rhi||!s.gpu.dev){
         s.pipeline_diag = "No RHI/Device";
@@ -823,45 +526,71 @@ bool ensure_pipeline(State& s){
     if(!s.gpu.sampler) return set_diag("createSampler");
     LAUNCHER3D_TRACE("ensure_pipeline: sampler ok");
 
-    auto create_vs = [&](plume::RenderShaderFormat fmt)->std::unique_ptr<plume::RenderShader>{
+    plume::RenderSamplerDesc shadow_samp{};
+    shadow_samp.minFilter = plume::RenderFilter::NEAREST;
+    shadow_samp.magFilter = plume::RenderFilter::NEAREST;
+    shadow_samp.addressU = plume::RenderTextureAddressMode::CLAMP;
+    shadow_samp.addressV = plume::RenderTextureAddressMode::CLAMP;
+    shadow_samp.addressW = plume::RenderTextureAddressMode::CLAMP;
+    s.gpu.shadow_sampler = d->createSampler(shadow_samp);
+    if (!s.gpu.shadow_sampler) return set_diag("createShadowSampler");
+    LAUNCHER3D_TRACE("ensure_pipeline: shadow sampler ok");
+
+    auto create_model_vs = [&](plume::RenderShaderFormat fmt)->std::unique_ptr<plume::RenderShader>{
         const void* blob = GET_SHADER_BLOB(LauncherModelVS, fmt);
         size_t blob_size = GET_SHADER_SIZE(LauncherModelVS, fmt);
         if(!blob || blob_size == 0) return nullptr;
         return d->createShader(blob, blob_size, "VSMain", fmt);
     };
-    auto create_ps = [&](plume::RenderShaderFormat fmt)->std::unique_ptr<plume::RenderShader>{
+    auto create_model_ps = [&](plume::RenderShaderFormat fmt)->std::unique_ptr<plume::RenderShader>{
         const void* blob = GET_SHADER_BLOB(LauncherModelPS, fmt);
         size_t blob_size = GET_SHADER_SIZE(LauncherModelPS, fmt);
         if(!blob || blob_size == 0) return nullptr;
         return d->createShader(blob, blob_size, "PSMain", fmt);
     };
+    auto create_shadow_vs = [&](plume::RenderShaderFormat fmt)->std::unique_ptr<plume::RenderShader>{
+        const void* blob = GET_SHADER_BLOB(LauncherShadowVS, fmt);
+        size_t blob_size = GET_SHADER_SIZE(LauncherShadowVS, fmt);
+        if(!blob || blob_size == 0) return nullptr;
+        return d->createShader(blob, blob_size, "VSMain", fmt);
+    };
+    auto create_shadow_ps = [&](plume::RenderShaderFormat fmt)->std::unique_ptr<plume::RenderShader>{
+        const void* blob = GET_SHADER_BLOB(LauncherShadowPS, fmt);
+        size_t blob_size = GET_SHADER_SIZE(LauncherShadowPS, fmt);
+        if(!blob || blob_size == 0) return nullptr;
+        return d->createShader(blob, blob_size, "PSMain", fmt);
+    };
 
-    auto try_shader_pair = [&](plume::RenderShaderFormat fmt)->bool{
+    auto try_shader_set = [&](plume::RenderShaderFormat fmt)->bool{
         LAUNCHER3D_TRACE("ensure_pipeline: try shaders format=%s", shader_format_name(fmt));
-        auto vs_try = create_vs(fmt);
-        auto ps_try = create_ps(fmt);
-        if(vs_try && ps_try){
+        auto vs_try = create_model_vs(fmt);
+        auto ps_try = create_model_ps(fmt);
+        auto sh_vs_try = create_shadow_vs(fmt);
+        auto sh_ps_try = create_shadow_ps(fmt);
+        if(vs_try && ps_try && sh_vs_try && sh_ps_try){
             s.gpu.vs = std::move(vs_try);
             s.gpu.ps = std::move(ps_try);
-            LAUNCHER3D_TRACE("ensure_pipeline: shader pair ok format=%s", shader_format_name(fmt));
+            s.gpu.shadow_vs = std::move(sh_vs_try);
+            s.gpu.shadow_ps = std::move(sh_ps_try);
+            LAUNCHER3D_TRACE("ensure_pipeline: shader set ok format=%s", shader_format_name(fmt));
             return true;
         }
-        LAUNCHER3D_TRACE("ensure_pipeline: shader pair failed format=%s", shader_format_name(fmt));
+        LAUNCHER3D_TRACE("ensure_pipeline: shader set failed format=%s", shader_format_name(fmt));
         return false;
     };
 
     bool shader_ok = false;
-    shader_ok = try_shader_pair(sf);
+    shader_ok = try_shader_set(sf);
 #ifdef _WIN32
-    if(!shader_ok && sf != plume::RenderShaderFormat::DXIL) shader_ok = try_shader_pair(plume::RenderShaderFormat::DXIL);
-    if(!shader_ok && sf != plume::RenderShaderFormat::SPIRV) shader_ok = try_shader_pair(plume::RenderShaderFormat::SPIRV);
+    if(!shader_ok && sf != plume::RenderShaderFormat::DXIL) shader_ok = try_shader_set(plume::RenderShaderFormat::DXIL);
+    if(!shader_ok && sf != plume::RenderShaderFormat::SPIRV) shader_ok = try_shader_set(plume::RenderShaderFormat::SPIRV);
 #elif defined(__APPLE__)
-    if(!shader_ok && sf != plume::RenderShaderFormat::METAL) shader_ok = try_shader_pair(plume::RenderShaderFormat::METAL);
-    if(!shader_ok && sf != plume::RenderShaderFormat::SPIRV) shader_ok = try_shader_pair(plume::RenderShaderFormat::SPIRV);
+    if(!shader_ok && sf != plume::RenderShaderFormat::METAL) shader_ok = try_shader_set(plume::RenderShaderFormat::METAL);
+    if(!shader_ok && sf != plume::RenderShaderFormat::SPIRV) shader_ok = try_shader_set(plume::RenderShaderFormat::SPIRV);
 #else
-    if(!shader_ok && sf != plume::RenderShaderFormat::SPIRV) shader_ok = try_shader_pair(plume::RenderShaderFormat::SPIRV);
+    if(!shader_ok && sf != plume::RenderShaderFormat::SPIRV) shader_ok = try_shader_set(plume::RenderShaderFormat::SPIRV);
 #endif
-    if(!shader_ok) return set_diag("createShader (VS/PS)");
+    if(!shader_ok) return set_diag("createShader (model/shadow)");
     LAUNCHER3D_TRACE("ensure_pipeline: shaders ready");
 
     s.gpu.set_builder = std::make_unique<plume::RenderDescriptorSetBuilder>();
@@ -870,8 +599,15 @@ bool ensure_pipeline(State& s){
     s.gpu.a_idx = s.gpu.set_builder->addTexture(1);
     s.gpu.n_idx = s.gpu.set_builder->addTexture(2);
     s.gpu.s_idx = s.gpu.set_builder->addTexture(3);
+    s.gpu.shadow_idx = s.gpu.set_builder->addTexture(5);
     s.gpu.set_builder->addImmutableSampler(4, s.gpu.sampler.get());
+    s.gpu.set_builder->addImmutableSampler(6, s.gpu.shadow_sampler.get());
     s.gpu.set_builder->end();
+
+    s.gpu.shadow_set_builder = std::make_unique<plume::RenderDescriptorSetBuilder>();
+    s.gpu.shadow_set_builder->begin();
+    s.gpu.shadow_cb_idx = s.gpu.shadow_set_builder->addConstantBuffer(0, 1);
+    s.gpu.shadow_set_builder->end();
 
     plume::RenderPipelineLayoutBuilder lb{};
     lb.begin(false, true);
@@ -880,6 +616,15 @@ bool ensure_pipeline(State& s){
     s.gpu.layout = lb.create(d);
     if(!s.gpu.layout) return set_diag("createPipelineLayout");
     LAUNCHER3D_TRACE("ensure_pipeline: pipeline layout ok");
+
+    plume::RenderPipelineLayoutBuilder shadow_lb{};
+    shadow_lb.begin(false, true);
+    shadow_lb.addDescriptorSet(*s.gpu.shadow_set_builder);
+    shadow_lb.end();
+    s.gpu.shadow_layout = shadow_lb.create(d);
+    if (!s.gpu.shadow_layout) return set_diag("createShadowPipelineLayout");
+    LAUNCHER3D_TRACE("ensure_pipeline: shadow pipeline layout ok");
+
     std::vector<plume::RenderInputElement> e{
         {"POSITION", 0, 0, plume::RenderFormat::R32G32B32_FLOAT, 0, offsetof(Vertex, p)},
         {"NORMAL",   0, 1, plume::RenderFormat::R32G32B32_FLOAT, 0, offsetof(Vertex, n)},
@@ -946,6 +691,43 @@ bool ensure_pipeline(State& s){
     s.gpu.pipeline_depth_format = chosen_depth_format;
     s.gpu.pipeline_uses_depth = (chosen_depth_format != plume::RenderFormat::UNKNOWN);
 
+    plume::RenderGraphicsPipelineDesc spd{};
+    spd.pipelineLayout = s.gpu.shadow_layout.get();
+    spd.vertexShader = s.gpu.shadow_vs.get();
+    spd.pixelShader = s.gpu.shadow_ps.get();
+    spd.renderTargetBlend[0] = plume::RenderBlendDesc::Copy();
+    spd.renderTargetCount = 1;
+    spd.renderTargetFormat[0] = kShadowColorFormat;
+    spd.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
+    spd.cullMode = plume::RenderCullMode::BACK;
+    spd.frontFace = plume::RenderFrontFace::COUNTER_CLOCKWISE;
+    spd.depthClipEnabled = true;
+    spd.depthEnabled = true;
+    spd.depthWriteEnabled = true;
+    spd.depthFunction = plume::RenderComparisonFunction::LESS;
+    spd.depthBias = 1;
+    spd.slopeScaledDepthBias = 2.0f;
+    spd.depthBiasClamp = 0.0f;
+    spd.inputSlots = &s.gpu.slot;
+    spd.inputSlotsCount = 1;
+    spd.inputElements = e.data();
+    spd.inputElementsCount = static_cast<uint32_t>(e.size());
+    s.gpu.shadow_pipeline.reset();
+    for (plume::RenderFormat depth_f : { plume::RenderFormat::D32_FLOAT, plume::RenderFormat::D32_FLOAT_S8_UINT }) {
+        spd.depthTargetFormat = depth_f;
+        s.gpu.shadow_pipeline = d->createGraphicsPipeline(spd);
+        if (s.gpu.shadow_pipeline) {
+            s.gpu.shadow_pipeline_depth_format = depth_f;
+            break;
+        }
+    }
+    s.gpu.shadow_pipeline_ok = (s.gpu.shadow_pipeline != nullptr);
+    s.gpu.shadow_pipeline_unavailable = !s.gpu.shadow_pipeline_ok;
+    if (!s.gpu.shadow_pipeline_ok) {
+        s.shadow.fallback_reason = "Shadow pipeline unavailable";
+        LAUNCHER3D_TRACE("ensure_pipeline: shadow pipeline unavailable, continuing without shadows");
+    }
+
     plume::RenderCommandListType queue_type = plume::RenderCommandListType::COPY;
     s.gpu.copy_q=d->createCommandQueue(queue_type);
     LAUNCHER3D_TRACE("ensure_pipeline: create queue COPY -> %p", ptr_addr(s.gpu.copy_q.get()));
@@ -995,6 +777,224 @@ DrawDecision draw_decision(const State& s){
 
 bool should_draw(const State& s){
     return draw_decision(s).draw;
+}
+
+struct ShadowPlanes {
+    float near_plane = 0.05f;
+    float far_plane = 8.0f;
+};
+
+struct ShadowAtlasFace {
+    int tile_x = 0;
+    int tile_y = 0;
+    V3 dir{};
+    V3 up{};
+};
+
+constexpr std::array<ShadowAtlasFace, kShadowFaceCount> kPointFaces = {{
+    { 0, 0, { 1.0f, 0.0f, 0.0f }, { 0.0f, -1.0f, 0.0f } }, // +X
+    { 1, 0, { -1.0f, 0.0f, 0.0f }, { 0.0f, -1.0f, 0.0f } }, // -X
+    { 2, 0, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f } }, // +Y
+    { 0, 1, { 0.0f, -1.0f, 0.0f }, { 0.0f, 0.0f, -1.0f } }, // -Y
+    { 1, 1, { 0.0f, 0.0f, 1.0f }, { 0.0f, -1.0f, 0.0f } },  // +Z
+    { 2, 1, { 0.0f, 0.0f, -1.0f }, { 0.0f, -1.0f, 0.0f } }, // -Z
+}};
+
+ShadowPlanes compute_shadow_planes(const State& s, const Transform& tr) {
+    const M4 model = TRS(tr);
+    const V3 model_center_ws = transform_point(model, s.cpu.bounds_center);
+    const V3 light_pos{ s.cfg.light.position_ws.x, s.cfg.light.position_ws.y, s.cfg.light.position_ws.z };
+
+    const float max_scale_axis = max3(std::abs(tr.scale.x), std::abs(tr.scale.y), std::abs(tr.scale.z));
+    const float model_radius_ws = std::max(s.cpu.bounds_radius * max_scale_axis, 0.001f);
+    const float light_to_center = len(sub(model_center_ws, light_pos));
+
+    ShadowPlanes planes{};
+    planes.near_plane = std::max(s.cfg.shadow.near_plane, kShadowNearPlaneMin);
+    planes.far_plane = std::max(light_to_center + model_radius_ws + 0.5f, planes.near_plane + kShadowFarPlaneMin);
+
+    if (s.cfg.light.range > 0.0f) {
+        planes.far_plane = std::min(planes.far_plane, s.cfg.light.range);
+    }
+    if (s.cfg.shadow.far_plane_override > 0.0f) {
+        planes.far_plane = s.cfg.shadow.far_plane_override;
+    }
+    planes.far_plane = std::max(planes.far_plane, planes.near_plane + kShadowFarPlaneMin);
+    return planes;
+}
+
+uint32_t clamp_shadow_resolution(uint32_t res) {
+    if (res >= 2048U) return 2048U;
+    if (res >= 1024U) return 1024U;
+    return 512U;
+}
+
+bool shadows_requested(const State& s) {
+    return s.cfg.shadow.enabled && (s.cfg.shadow.mode != ShadowMode::Disabled);
+}
+
+void mark_shadow_dirty(State& s, const char* reason = nullptr) {
+    s.shadow.dirty = true;
+    if (reason != nullptr) {
+        s.shadow.fallback_reason = reason;
+    }
+}
+
+bool ensure_shadow_fallback_texture(State& s) {
+    if (s.gpu.tex_shadow_fallback != nullptr) {
+        return true;
+    }
+
+    if (!(s.gpu.dev && s.gpu.copy_q && s.gpu.copy_l && s.gpu.copy_f)) {
+        return false;
+    }
+    s.gpu.tex_shadow_fallback = tex_rgba(
+        s.gpu.dev,
+        s.gpu.copy_q.get(),
+        s.gpu.copy_l.get(),
+        s.gpu.copy_f.get(),
+        s.gpu.upload,
+        { 255, 255, 255, 255 }
+    );
+    return (s.gpu.tex_shadow_fallback != nullptr);
+}
+
+void clear_shadow_targets(State& s) {
+    s.gpu.tex_shadow.reset();
+    s.gpu.tex_shadow_depth.reset();
+    s.gpu.shadow_fb.reset();
+    s.shadow.resources_ready = false;
+}
+
+bool create_shadow_targets(State& s, ActiveShadowMode mode, uint32_t face_resolution) {
+    clear_shadow_targets(s);
+    if (!s.gpu.dev) {
+        return false;
+    }
+
+    uint32_t tex_w = face_resolution;
+    uint32_t tex_h = face_resolution;
+    if (mode == ActiveShadowMode::PointAtlas) {
+        tex_w = face_resolution * 3U;
+        tex_h = face_resolution * 2U;
+    }
+
+    auto color_desc = plume::RenderTextureDesc::ColorTarget(tex_w, tex_h, kShadowColorFormat);
+    auto depth_desc = plume::RenderTextureDesc::DepthTarget(tex_w, tex_h, s.gpu.shadow_pipeline_depth_format);
+    s.gpu.tex_shadow = s.gpu.dev->createTexture(color_desc);
+    s.gpu.tex_shadow_depth = s.gpu.dev->createTexture(depth_desc);
+    if (!(s.gpu.tex_shadow && s.gpu.tex_shadow_depth)) {
+        clear_shadow_targets(s);
+        return false;
+    }
+
+    const plume::RenderTexture* color_attachment = s.gpu.tex_shadow.get();
+    plume::RenderFramebufferDesc fb_desc{};
+    fb_desc.colorAttachments = &color_attachment;
+    fb_desc.colorAttachmentsCount = 1;
+    fb_desc.depthAttachment = s.gpu.tex_shadow_depth.get();
+    fb_desc.depthAttachmentReadOnly = false;
+    s.gpu.shadow_fb = s.gpu.dev->createFramebuffer(fb_desc);
+    if (!s.gpu.shadow_fb) {
+        clear_shadow_targets(s);
+        return false;
+    }
+
+    s.shadow.active_mode = mode;
+    s.shadow.effective_resolution = face_resolution;
+    s.shadow.resources_ready = true;
+    s.shadow.has_signature = false;
+    s.shadow.dirty = true;
+    return true;
+}
+
+bool ensure_shadow_resources(State& s) {
+    if (!shadows_requested(s) || !s.gpu.shadow_pipeline_ok) {
+        s.shadow.active_mode = ActiveShadowMode::Disabled;
+        s.shadow.resources_ready = false;
+        return true;
+    }
+
+    const uint32_t requested_res = clamp_shadow_resolution(s.cfg.shadow.resolution);
+    const bool reuse_current =
+        s.shadow.resources_ready &&
+        (s.shadow.effective_resolution == requested_res) &&
+        ((s.shadow.active_mode == ActiveShadowMode::PointAtlas && s.cfg.shadow.mode != ShadowMode::SpotOnly) ||
+         (s.shadow.active_mode == ActiveShadowMode::Spot && s.cfg.shadow.mode == ShadowMode::SpotOnly));
+    if (reuse_current) {
+        return true;
+    }
+
+    struct Candidate { ActiveShadowMode mode; uint32_t res; const char* label; };
+    std::vector<Candidate> candidates;
+    candidates.reserve(6);
+
+    const auto add_candidate = [&](ActiveShadowMode mode, uint32_t res, const char* label) {
+        if ((res != 512U) && (res != 1024U) && (res != 2048U)) {
+            return;
+        }
+        if (res > requested_res) {
+            return;
+        }
+        candidates.push_back({ mode, res, label });
+    };
+
+    if (s.cfg.shadow.mode == ShadowMode::SpotOnly) {
+        if (requested_res >= 2048U) {
+            add_candidate(ActiveShadowMode::Spot, 2048U, "Spot@2048");
+            add_candidate(ActiveShadowMode::Spot, 1024U, "Spot@1024");
+        } else if (requested_res >= 1024U) {
+            add_candidate(ActiveShadowMode::Spot, 1024U, "Spot@1024");
+        } else {
+            add_candidate(ActiveShadowMode::Spot, 512U, "Spot@512");
+        }
+    } else {
+        if (requested_res >= 2048U) {
+            // Required fallback chain: Point2048 -> Point1024 -> Spot2048 -> Spot1024.
+            add_candidate(ActiveShadowMode::PointAtlas, 2048U, "Point@2048");
+            add_candidate(ActiveShadowMode::PointAtlas, 1024U, "Point@1024");
+            add_candidate(ActiveShadowMode::Spot, 2048U, "Spot@2048");
+            add_candidate(ActiveShadowMode::Spot, 1024U, "Spot@1024");
+        } else if (requested_res >= 1024U) {
+            add_candidate(ActiveShadowMode::PointAtlas, 1024U, "Point@1024");
+            add_candidate(ActiveShadowMode::Spot, 1024U, "Spot@1024");
+        } else {
+            add_candidate(ActiveShadowMode::PointAtlas, 512U, "Point@512");
+            add_candidate(ActiveShadowMode::Spot, 512U, "Spot@512");
+        }
+    }
+
+    bool created = false;
+    for (const Candidate& c : candidates) {
+        if (create_shadow_targets(s, c.mode, c.res)) {
+            s.shadow.fallback_reason = c.label;
+            created = true;
+            break;
+        }
+    }
+
+    if (!created) {
+        clear_shadow_targets(s);
+        s.shadow.active_mode = ActiveShadowMode::Disabled;
+        s.shadow.resources_ready = false;
+        s.shadow.fallback_reason = "Shadow disabled (resource fallback)";
+    }
+    return true;
+}
+
+bool shadow_signature_changed(const State& s, const Transform& tr) {
+    if (!s.shadow.has_signature) return true;
+    if (!near_equal_transform(s.shadow.last_transform, tr)) return true;
+    if (!near_equal_light(s.shadow.last_light, s.cfg.light)) return true;
+    if (!near_equal_shadow_cfg(s.shadow.last_shadow_cfg, s.cfg.shadow)) return true;
+    return false;
+}
+
+void update_shadow_signature(State& s, const Transform& tr) {
+    s.shadow.last_transform = tr;
+    s.shadow.last_light = s.cfg.light;
+    s.shadow.last_shadow_cfg = s.cfg.shadow;
+    s.shadow.has_signature = true;
 }
 
 struct PrimaryColorAttachment {
@@ -1128,6 +1128,153 @@ plume::RenderFramebuffer* resolve_framebuffer_for_3d_pass(State& s, plume::Rende
     return depth_fb_it->second.get();
 }
 
+V3 compute_model_center_ws(const State& s, const Transform& tr) {
+    const M4 model = TRS(tr);
+    return transform_point(model, s.cpu.bounds_center);
+}
+
+M4 compute_spot_shadow_view_proj(const State& s, const Transform& tr, const ShadowPlanes& planes) {
+    const V3 light_pos{ s.cfg.light.position_ws.x, s.cfg.light.position_ws.y, s.cfg.light.position_ws.z };
+    const V3 center_ws = compute_model_center_ws(s, tr);
+    V3 forward = norm(sub(center_ws, light_pos));
+    if (len(forward) <= 1e-6f) {
+        forward = { 0.0f, -1.0f, 0.0f };
+    }
+    const V3 world_up = (std::abs(dot(forward, { 0.0f, 1.0f, 0.0f })) > 0.95f) ? V3{ 0.0f, 0.0f, 1.0f } : V3{ 0.0f, 1.0f, 0.0f };
+
+    const float model_radius_ws = std::max(s.cpu.bounds_radius * max3(std::abs(tr.scale.x), std::abs(tr.scale.y), std::abs(tr.scale.z)), 0.01f);
+    const float dist = std::max(len(sub(center_ws, light_pos)), 0.01f);
+    const float cone = 2.0f * std::asin(std::clamp(model_radius_ws / dist, 0.0f, 1.0f));
+    const float fov = std::clamp(cone * 1.30f, 35.0f * (std::numbers::pi_v<float> / 180.0f), 120.0f * (std::numbers::pi_v<float> / 180.0f));
+
+    const M4 light_view = LookAt(light_pos, add(light_pos, forward), world_up);
+    const M4 light_proj = P(fov, 1.0f, planes.near_plane, planes.far_plane);
+    return Mul(light_view, light_proj);
+}
+
+M4 compute_point_shadow_view_proj(const State& s, uint32_t face_index, const ShadowPlanes& planes) {
+    const ShadowAtlasFace& face = kPointFaces[face_index];
+    const V3 light_pos{ s.cfg.light.position_ws.x, s.cfg.light.position_ws.y, s.cfg.light.position_ws.z };
+    const M4 light_view = LookAt(light_pos, add(light_pos, face.dir), face.up);
+    const M4 light_proj = P(90.0f * (std::numbers::pi_v<float> / 180.0f), 1.0f, planes.near_plane, planes.far_plane);
+    return Mul(light_view, light_proj);
+}
+
+bool draw_shadow_pass(State& s, plume::RenderCommandList* list, const Transform& tr) {
+    if (!s.shadow.resources_ready || (s.gpu.shadow_fb == nullptr) || (s.gpu.shadow_set == nullptr) || (s.gpu.shadow_cb == nullptr)) {
+        return false;
+    }
+
+    const ShadowPlanes planes = compute_shadow_planes(s, tr);
+    const uint32_t face_res = s.shadow.effective_resolution;
+    const uint32_t tex_w = s.gpu.shadow_fb->getWidth();
+    const uint32_t tex_h = s.gpu.shadow_fb->getHeight();
+    if ((face_res == 0U) || (tex_w == 0U) || (tex_h == 0U)) {
+        return false;
+    }
+
+    plume::RenderTextureBarrier write_barriers[] = {
+        { s.gpu.tex_shadow.get(), plume::RenderTextureLayout::COLOR_WRITE },
+        { s.gpu.tex_shadow_depth.get(), plume::RenderTextureLayout::DEPTH_WRITE }
+    };
+    list->barriers(plume::RenderBarrierStage::GRAPHICS, write_barriers, static_cast<uint32_t>(std::size(write_barriers)));
+
+    list->setFramebuffer(s.gpu.shadow_fb.get());
+    list->setGraphicsPipelineLayout(s.gpu.shadow_layout.get());
+    list->setPipeline(s.gpu.shadow_pipeline.get());
+    list->setGraphicsDescriptorSet(s.gpu.shadow_set.get(), 0);
+
+    plume::RenderVertexBufferView vbv(s.gpu.vb.get(), static_cast<uint64_t>(s.cpu.vertices.size()) * sizeof(Vertex));
+    plume::RenderIndexBufferView ibv(s.gpu.ib.get(), static_cast<uint64_t>(s.cpu.indices.size()) * sizeof(uint32_t), plume::RenderFormat::R32_UINT);
+    list->setVertexBuffers(0, &vbv, 1, &s.gpu.slot);
+    list->setIndexBuffer(&ibv);
+
+    ShadowPassConstants shadow_cb{};
+    shadow_cb.model = TRS(tr);
+    shadow_cb.light_pos_far = { s.cfg.light.position_ws.x, s.cfg.light.position_ws.y, s.cfg.light.position_ws.z, planes.far_plane };
+
+    const bool point_mode = (s.shadow.active_mode == ActiveShadowMode::PointAtlas);
+    const uint32_t pass_count = point_mode ? kShadowFaceCount : 1U;
+    for (uint32_t pass = 0; pass < pass_count; pass++) {
+        int tile_x = 0;
+        int tile_y = 0;
+        if (point_mode) {
+            tile_x = kPointFaces[pass].tile_x;
+            tile_y = kPointFaces[pass].tile_y;
+            shadow_cb.light_view_proj = compute_point_shadow_view_proj(s, pass, planes);
+        } else {
+            shadow_cb.light_view_proj = compute_spot_shadow_view_proj(s, tr, planes);
+        }
+
+        const int32_t left = static_cast<int32_t>(tile_x * static_cast<int>(face_res));
+        const int32_t top = static_cast<int32_t>(tile_y * static_cast<int>(face_res));
+        const int32_t right = left + static_cast<int32_t>(face_res);
+        const int32_t bottom = top + static_cast<int32_t>(face_res);
+        const plume::RenderRect clear_rect{ left, top, right, bottom };
+        const plume::RenderViewport vp{
+            static_cast<float>(left),
+            static_cast<float>(top),
+            static_cast<float>(face_res),
+            static_cast<float>(face_res),
+            0.0f,
+            1.0f
+        };
+        const plume::RenderRect scissor{ left, top, right, bottom };
+
+        list->clearColor(0, plume::RenderColor(1.0f, 1.0f, 1.0f, 1.0f), &clear_rect, 1);
+        list->clearDepth(true, 1.0f, &clear_rect, 1);
+        list->setViewports(vp);
+        list->setScissors(scissor);
+
+        void* cb_ptr = s.gpu.shadow_cb->map();
+        if (cb_ptr == nullptr) {
+            return false;
+        }
+        std::memcpy(cb_ptr, &shadow_cb, sizeof(shadow_cb));
+        s.gpu.shadow_cb->unmap();
+
+        list->drawIndexedInstanced(static_cast<uint32_t>(s.gpu.index_count), 1, 0, 0, 0);
+    }
+
+    plume::RenderTextureBarrier read_barrier(s.gpu.tex_shadow.get(), plume::RenderTextureLayout::SHADER_READ);
+    list->barriers(plume::RenderBarrierStage::GRAPHICS, &read_barrier, 1);
+    s.shadow.render_count++;
+    return true;
+}
+
+bool update_shadows_if_needed(State& s, plume::RenderCommandList* list, const Transform& tr) {
+    if (!shadows_requested(s) || !s.gpu.shadow_pipeline_ok) {
+        s.shadow.active_mode = ActiveShadowMode::Disabled;
+        s.shadow.resources_ready = false;
+        return true;
+    }
+
+    if (!ensure_shadow_resources(s)) {
+        return true;
+    }
+    if (!s.shadow.resources_ready) {
+        return true;
+    }
+
+    const bool intro_active = !(s.intro_finished && s.cfg.intro.play_once);
+    if (intro_active || shadow_signature_changed(s, tr)) {
+        s.shadow.dirty = true;
+    }
+
+    if (!s.shadow.dirty) {
+        return true;
+    }
+
+    if (!draw_shadow_pass(s, list, tr)) {
+        s.shadow.fallback_reason = "Shadow draw failed";
+        return false;
+    }
+
+    update_shadow_signature(s, tr);
+    s.shadow.dirty = false;
+    return true;
+}
+
 #if !defined(NDEBUG)
 void log_loaded_model_info(const Config& cfg, const CpuModel& cpu){
     V3 mn{
@@ -1179,11 +1326,14 @@ recompui::Slider* mk_slider(
     auto* row = c.create_element<recompui::Element>(p);
     row->set_display(recompui::Display::Flex);
     row->set_flex_direction(recompui::FlexDirection::Column);
+    row->set_flex_shrink(0.0f);
+    row->set_min_height(40.0f);
     row->set_margin_bottom(5.0f);
 
     c.create_element<recompui::Label>(row, t, recompui::LabelStyle::Annotation);
 
     auto* sld = c.create_element<recompui::Slider>(row, recompui::SliderType::Double);
+    sld->set_width(100.0f, recompui::Unit::Percent);
     sld->set_min_value(mn);
     sld->set_max_value(mx);
     sld->set_step_value(stp);
@@ -1201,7 +1351,10 @@ void ensure_panel(State& s,recompui::Element* menu_container){
     s.panel.root->set_position(recompui::Position::Absolute);
     s.panel.root->set_top(s.panel.top_dp);
     s.panel.root->set_left(s.panel.left_dp);
-    s.panel.root->set_width(320);
+    s.panel.root->set_width(520);
+    s.panel.root->set_min_width(500);
+    s.panel.root->set_max_width(58.0f, recompui::Unit::Percent);
+    s.panel.root->set_max_height(96.0f, recompui::Unit::Percent);
     s.panel.root->set_padding(10);
     s.panel.root->set_border_radius(10);
     s.panel.root->set_background_color({0,0,0,170});
@@ -1209,6 +1362,7 @@ void ensure_panel(State& s,recompui::Element* menu_container){
     auto* h=c.create_element<recompui::Clickable>(s.panel.root, true);
     h->set_display(recompui::Display::Flex);
     h->set_flex_direction(recompui::FlexDirection::Row);
+    h->set_flex_shrink(0.0f);
     h->set_justify_content(recompui::JustifyContent::SpaceBetween);
     h->set_width(100.0f, recompui::Unit::Percent);
     h->set_margin_bottom(6);
@@ -1283,6 +1437,11 @@ void ensure_panel(State& s,recompui::Element* menu_container){
     s.panel.content = c.create_element<recompui::Element>(s.panel.root);
     s.panel.content->set_display(recompui::Display::Flex);
     s.panel.content->set_flex_direction(recompui::FlexDirection::Column);
+    s.panel.content->set_flex_shrink(0.0f);
+    s.panel.content->set_max_height(560.0f);
+    s.panel.content->set_overflow_y(recompui::Overflow::Auto);
+    s.panel.content->set_overflow_x(recompui::Overflow::Hidden);
+    s.panel.content->set_padding_right(8.0f);
     s.panel.content->display_hide();
     tgl->add_pressed_callback([&s, tgl]() {
         bool open = false;
@@ -1304,46 +1463,190 @@ void ensure_panel(State& s,recompui::Element* menu_container){
         }
     });
     s.panel.status = c.create_element<recompui::Label>(s.panel.content, "Status", recompui::LabelStyle::Annotation);
+    s.panel.status->set_flex_shrink(0.0f);
     s.panel.status->set_margin_bottom(4);
+
+    auto* cam_row = c.create_element<recompui::Element>(s.panel.content);
+    cam_row->set_display(recompui::Display::Flex);
+    cam_row->set_flex_direction(recompui::FlexDirection::Row);
+    cam_row->set_flex_shrink(0.0f);
+    cam_row->set_justify_content(recompui::JustifyContent::SpaceBetween);
+    cam_row->set_margin_bottom(4.0f);
+
+    auto* cam_hold = c.create_element<recompui::Clickable>(cam_row, true);
+    cam_hold->set_flex_grow(1.0f);
+    cam_hold->set_display(recompui::Display::Flex);
+    cam_hold->set_flex_direction(recompui::FlexDirection::Row);
+    cam_hold->set_align_items(recompui::AlignItems::Center);
+    cam_hold->set_padding_left(8.0f);
+    cam_hold->set_padding_right(8.0f);
+    cam_hold->set_height(28.0f);
+    cam_hold->set_border_width(1.0f);
+    cam_hold->set_border_radius(8.0f);
+    cam_hold->set_border_color({ 255, 194, 0, 255 });
+    cam_hold->set_background_color({ 70, 45, 0, 170 });
+    c.create_element<recompui::Label>(cam_hold, "Hold+Drag Camera", recompui::LabelStyle::Annotation);
+    cam_hold->add_dragged_callback([&s](float x, float y, recompui::DragPhase phase) {
+        std::lock_guard lock(s.mx);
+        if (phase == recompui::DragPhase::Start) {
+            s.panel.camera_drag_start_x = x;
+            s.panel.camera_drag_start_y = y;
+            s.panel.camera_drag_start_yaw = s.panel.camera_yaw_deg;
+            s.panel.camera_drag_start_pitch = s.panel.camera_pitch_deg;
+            return;
+        }
+        if (phase == recompui::DragPhase::Move) {
+            constexpr float kOrbitSensitivity = 0.20f;
+            const float dx = x - s.panel.camera_drag_start_x;
+            const float dy = y - s.panel.camera_drag_start_y;
+            s.panel.camera_yaw_deg = s.panel.camera_drag_start_yaw + dx * kOrbitSensitivity;
+            s.panel.camera_pitch_deg = std::clamp(s.panel.camera_drag_start_pitch - dy * kOrbitSensitivity, -89.0f, 89.0f);
+        }
+    });
+
+    auto* cam_toggle = c.create_element<recompui::Button>(cam_row, "Cam On/Off", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Small);
+    cam_toggle->set_margin_left(8.0f);
+    cam_toggle->add_pressed_callback([&s]() {
+        std::lock_guard lock(s.mx);
+        s.panel.free_camera_enabled = !s.panel.free_camera_enabled;
+    });
+
+    auto* cam_reset_row = c.create_element<recompui::Element>(s.panel.content);
+    cam_reset_row->set_display(recompui::Display::Flex);
+    cam_reset_row->set_flex_direction(recompui::FlexDirection::Row);
+    cam_reset_row->set_flex_shrink(0.0f);
+    cam_reset_row->set_justify_content(recompui::JustifyContent::SpaceBetween);
+    cam_reset_row->set_margin_bottom(4.0f);
+
+    auto* cam_reset = c.create_element<recompui::Button>(cam_reset_row, "Cam Reset", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Small);
+    cam_reset->add_pressed_callback([&s]() {
+        std::lock_guard lock(s.mx);
+        s.panel.camera_yaw_deg = 0.0f;
+        s.panel.camera_pitch_deg = 0.0f;
+        s.panel.camera_distance = kCameraZ;
+        s.panel.camera_fov_deg = 55.0f;
+        s.panel.camera_target_x = 0.0f;
+        s.panel.camera_target_y = 0.0f;
+        s.panel.camera_target_z = 0.0f;
+    });
+
+    auto* marker_toggle = c.create_element<recompui::Button>(cam_reset_row, "Light Gizmo", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Small);
+    marker_toggle->add_pressed_callback([&s]() {
+        std::lock_guard lock(s.mx);
+        s.panel.show_light_marker = !s.panel.show_light_marker;
+    });
+
     const auto add_float_slider = [&](const std::string& title, double min_value, double max_value, double step_value, float initial, const std::function<void(float)>& setter) {
         mk_slider(s.panel.content, title, min_value, max_value, step_value, initial, [setter](double v) {
             setter(static_cast<float>(v));
         });
     };
+    const auto add_shadow_float = [&](const std::string& title, double min_value, double max_value, double step_value, float initial, const std::function<void(float)>& setter) {
+        add_float_slider(title, min_value, max_value, step_value, initial, [&s, setter](float v) {
+            setter(v);
+            mark_shadow_dirty(s);
+        });
+    };
 
-    add_float_slider("Pos X", -6.0, 6.0, 0.01, s.cfg.target_transform.position.x, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.position.x = v; });
-    add_float_slider("Pos Y", -6.0, 6.0, 0.01, s.cfg.target_transform.position.y, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.position.y = v; });
-    add_float_slider("Pos Z", -12.0, 4.0, 0.01, s.cfg.target_transform.position.z, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.position.z = v; });
-    add_float_slider("Rot X", -180.0, 180.0, 0.1, s.cfg.target_transform.rotation_deg.pitch, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.rotation_deg.pitch = v; });
-    add_float_slider("Rot Y", -180.0, 180.0, 0.1, s.cfg.target_transform.rotation_deg.yaw, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.rotation_deg.yaw = v; });
-    add_float_slider("Rot Z", -180.0, 180.0, 0.1, s.cfg.target_transform.rotation_deg.roll, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.rotation_deg.roll = v; });
+    add_float_slider("Cam Dist", 0.2, 24.0, 0.01, s.panel.camera_distance, [&s](float v) {
+        std::lock_guard lock(s.mx);
+        s.panel.camera_distance = std::max(0.2f, v);
+    });
+    add_float_slider("Cam FOV", 20.0, 110.0, 0.1, s.panel.camera_fov_deg, [&s](float v) {
+        std::lock_guard lock(s.mx);
+        s.panel.camera_fov_deg = std::clamp(v, 20.0f, 110.0f);
+    });
+    add_float_slider("Cam Target X", -8.0, 8.0, 0.01, s.panel.camera_target_x, [&s](float v) {
+        std::lock_guard lock(s.mx);
+        s.panel.camera_target_x = v;
+    });
+    add_float_slider("Cam Target Y", -8.0, 8.0, 0.01, s.panel.camera_target_y, [&s](float v) {
+        std::lock_guard lock(s.mx);
+        s.panel.camera_target_y = v;
+    });
+    add_float_slider("Cam Target Z", -12.0, 8.0, 0.01, s.panel.camera_target_z, [&s](float v) {
+        std::lock_guard lock(s.mx);
+        s.panel.camera_target_z = v;
+    });
+    add_float_slider("Light Gizmo Size", 0.05, 8.0, 0.01, s.panel.light_marker_scale, [&s](float v) {
+        std::lock_guard lock(s.mx);
+        s.panel.light_marker_scale = std::clamp(v, 0.05f, 8.0f);
+    });
+
+    add_shadow_float("Pos X", -6.0, 6.0, 0.01, s.cfg.target_transform.position.x, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.position.x = v; });
+    add_shadow_float("Pos Y", -6.0, 6.0, 0.01, s.cfg.target_transform.position.y, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.position.y = v; });
+    add_shadow_float("Pos Z", -12.0, 4.0, 0.01, s.cfg.target_transform.position.z, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.position.z = v; });
+    add_shadow_float("Rot X", -180.0, 180.0, 0.1, s.cfg.target_transform.rotation_deg.pitch, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.rotation_deg.pitch = v; });
+    add_shadow_float("Rot Y", -180.0, 180.0, 0.1, s.cfg.target_transform.rotation_deg.yaw, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.rotation_deg.yaw = v; });
+    add_shadow_float("Rot Z", -180.0, 180.0, 0.1, s.cfg.target_transform.rotation_deg.roll, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.rotation_deg.roll = v; });
 
     mk_slider(s.panel.content, "Scale", 0.01, 4.0, 0.01, s.cfg.target_transform.scale.x, [&s](double v) {
         const float uniform_scale = static_cast<float>(v);
         std::lock_guard lock(s.mx);
         s.cfg.target_transform.scale = { uniform_scale, uniform_scale, uniform_scale };
+        mark_shadow_dirty(s);
     });
-    add_float_slider("Light X", -10.0, 10.0, 0.01, s.cfg.light.position_ws.x, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.position_ws.x = v; });
-    add_float_slider("Light Y", -10.0, 10.0, 0.01, s.cfg.light.position_ws.y, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.position_ws.y = v; });
-    add_float_slider("Light Z", -10.0, 10.0, 0.01, s.cfg.light.position_ws.z, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.position_ws.z = v; });
-    add_float_slider("Light Range", 0.1, 50.0, 0.1, s.cfg.light.range, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.range = v; });
-    add_float_slider("Light Int", 0.0, 10.0, 0.01, s.cfg.light.intensity, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.intensity = v; });
-    add_float_slider("Ambient", 0.0, 2.0, 0.01, s.cfg.light.ambient_intensity, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.ambient_intensity = v; });
-    add_float_slider("Light R", 0.0, 4.0, 0.01, s.cfg.light.color.x, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.color.x = v; });
-    add_float_slider("Light G", 0.0, 4.0, 0.01, s.cfg.light.color.y, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.color.y = v; });
-    add_float_slider("Light B", 0.0, 4.0, 0.01, s.cfg.light.color.z, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.color.z = v; });
+    add_shadow_float("Light X", -10.0, 10.0, 0.01, s.cfg.light.position_ws.x, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.position_ws.x = v; });
+    add_shadow_float("Light Y", -10.0, 10.0, 0.01, s.cfg.light.position_ws.y, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.position_ws.y = v; });
+    add_shadow_float("Light Z", -10.0, 10.0, 0.01, s.cfg.light.position_ws.z, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.position_ws.z = v; });
+    add_shadow_float("Light Range", 0.1, 50.0, 0.1, s.cfg.light.range, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.range = v; });
+    add_shadow_float("Light Int", 0.0, 10.0, 0.01, s.cfg.light.intensity, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.intensity = v; });
+    add_shadow_float("Ambient", 0.0, 2.0, 0.01, s.cfg.light.ambient_intensity, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.ambient_intensity = v; });
+    add_shadow_float("Light R", 0.0, 4.0, 0.01, s.cfg.light.color.x, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.color.x = v; });
+    add_shadow_float("Light G", 0.0, 4.0, 0.01, s.cfg.light.color.y, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.color.y = v; });
+    add_shadow_float("Light B", 0.0, 4.0, 0.01, s.cfg.light.color.z, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.color.z = v; });
+    add_shadow_float("Shadow Str", 0.0, 1.0, 0.01, s.cfg.shadow.strength, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.shadow.strength = v; });
+    add_shadow_float("Shadow Bias", 0.0, 0.02, 0.0001, s.cfg.shadow.depth_bias, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.shadow.depth_bias = v; });
+    add_shadow_float("Normal Bias", 0.0, 0.2, 0.0005, s.cfg.shadow.normal_bias, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.shadow.normal_bias = v; });
+    add_shadow_float("Shadow Soft", 0.1, 4.0, 0.01, s.cfg.shadow.softness, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.shadow.softness = v; });
+    add_shadow_float("Shadow Near", 0.01, 2.0, 0.01, s.cfg.shadow.near_plane, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.shadow.near_plane = v; });
+    add_shadow_float("Shadow FarOv", 0.0, 50.0, 0.1, s.cfg.shadow.far_plane_override, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.shadow.far_plane_override = v; });
     add_float_slider("Intro Time", 0.1, 8.0, 0.01, s.cfg.intro.duration_sec, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.intro.duration_sec = v; });
     add_float_slider("Overshoot", 0.0, 1.0, 0.01, s.cfg.intro.overshoot, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.intro.overshoot = v; });
     add_float_slider("Damping", 0.0, 20.0, 0.05, s.cfg.intro.damping, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.intro.damping = v; });
+
+    auto* shadow_row = c.create_element<recompui::Element>(s.panel.content);
+    shadow_row->set_display(recompui::Display::Flex);
+    shadow_row->set_flex_direction(recompui::FlexDirection::Row);
+    shadow_row->set_flex_shrink(0.0f);
+    shadow_row->set_justify_content(recompui::JustifyContent::SpaceBetween);
+
+    auto* b_shadow_toggle = c.create_element<recompui::Button>(shadow_row, "Shadow On/Off", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Small);
+    b_shadow_toggle->add_pressed_callback([&s]() {
+        std::lock_guard lock(s.mx);
+        s.cfg.shadow.enabled = !s.cfg.shadow.enabled;
+        mark_shadow_dirty(s);
+    });
+
+    auto* b_shadow_mode = c.create_element<recompui::Button>(shadow_row, "Mode Cycle", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Small);
+    b_shadow_mode->add_pressed_callback([&s]() {
+        std::lock_guard lock(s.mx);
+        if (s.cfg.shadow.mode == ShadowMode::PointCubePreferred) {
+            s.cfg.shadow.mode = ShadowMode::SpotOnly;
+        } else if (s.cfg.shadow.mode == ShadowMode::SpotOnly) {
+            s.cfg.shadow.mode = ShadowMode::Disabled;
+        } else {
+            s.cfg.shadow.mode = ShadowMode::PointCubePreferred;
+        }
+        mark_shadow_dirty(s);
+    });
+
+    mk_slider(s.panel.content, "Shadow Res", 512.0, 2048.0, 512.0, static_cast<double>(s.cfg.shadow.resolution), [&s](double v) {
+        std::lock_guard lock(s.mx);
+        s.cfg.shadow.resolution = clamp_shadow_resolution(static_cast<uint32_t>(v));
+        mark_shadow_dirty(s);
+    });
     auto* row = c.create_element<recompui::Element>(s.panel.content);
     row->set_display(recompui::Display::Flex);
     row->set_flex_direction(recompui::FlexDirection::Row);
+    row->set_flex_shrink(0.0f);
     row->set_justify_content(recompui::JustifyContent::SpaceBetween);
 
     auto* b_reset_pose = c.create_element<recompui::Button>(row, "Reset Pose", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Small);
     b_reset_pose->add_pressed_callback([&s]() {
         std::lock_guard lock(s.mx);
         s.cfg.target_transform = s.cfg_initial.target_transform;
+        mark_shadow_dirty(s);
     });
 
     auto* b0 = c.create_element<recompui::Button>(row, "Reset Intro", recompui::ButtonStyle::Warning, recompui::ButtonSize::Small);
@@ -1368,7 +1671,13 @@ bool create_gpu_resources_if_needed(State& s) {
     auto* d = s.gpu.dev;
     const uint64_t vb_sz = static_cast<uint64_t>(s.cpu.vertices.size()) * sizeof(Vertex);
     const uint64_t ib_sz = static_cast<uint64_t>(s.cpu.indices.size()) * sizeof(uint32_t);
+    std::vector<Vertex> marker_vertices;
+    std::vector<uint32_t> marker_indices;
+    build_debug_light_marker_mesh(marker_vertices, marker_indices);
+    const uint64_t marker_vb_sz = static_cast<uint64_t>(marker_vertices.size()) * sizeof(Vertex);
+    const uint64_t marker_ib_sz = static_cast<uint64_t>(marker_indices.size()) * sizeof(uint32_t);
     const uint64_t cb_sz = align_up_u64(static_cast<uint64_t>(sizeof(Constants)), 256);
+    const uint64_t shadow_cb_sz = align_up_u64(static_cast<uint64_t>(sizeof(ShadowPassConstants)), 256);
 
     if (!vb_sz || !ib_sz) {
         LAUNCHER3D_TRACE("hook_draw: skipped GPU resource creation because vb/ib size is zero");
@@ -1376,29 +1685,51 @@ bool create_gpu_resources_if_needed(State& s) {
     }
 
     LAUNCHER3D_TRACE(
-        "hook_draw: creating GPU resources vb=%lluB ib=%lluB cb=%lluB(aligned)",
+        "hook_draw: creating GPU resources vb=%lluB ib=%lluB marker_vb=%lluB marker_ib=%lluB cb=%lluB(aligned) shadow_cb=%lluB(aligned)",
         static_cast<unsigned long long>(vb_sz),
         static_cast<unsigned long long>(ib_sz),
-        static_cast<unsigned long long>(cb_sz)
+        static_cast<unsigned long long>(marker_vb_sz),
+        static_cast<unsigned long long>(marker_ib_sz),
+        static_cast<unsigned long long>(cb_sz),
+        static_cast<unsigned long long>(shadow_cb_sz)
     );
 
     LAUNCHER3D_TRACE("hook_draw: step create vb upload");
     s.gpu.vb = d->createBuffer(plume::RenderBufferDesc::UploadBuffer(vb_sz, plume::RenderBufferFlag::VERTEX));
     LAUNCHER3D_TRACE("hook_draw: step create ib upload");
     s.gpu.ib = d->createBuffer(plume::RenderBufferDesc::UploadBuffer(ib_sz, plume::RenderBufferFlag::INDEX));
+    LAUNCHER3D_TRACE("hook_draw: step create marker vb/ib upload");
+    s.gpu.marker_vb = d->createBuffer(plume::RenderBufferDesc::UploadBuffer(std::max<uint64_t>(marker_vb_sz, sizeof(Vertex)), plume::RenderBufferFlag::VERTEX));
+    s.gpu.marker_ib = d->createBuffer(plume::RenderBufferDesc::UploadBuffer(std::max<uint64_t>(marker_ib_sz, sizeof(uint32_t)), plume::RenderBufferFlag::INDEX));
     LAUNCHER3D_TRACE("hook_draw: step create cb upload");
     s.gpu.cb = d->createBuffer(plume::RenderBufferDesc::UploadBuffer(cb_sz, plume::RenderBufferFlag::CONSTANT));
     s.gpu.cb_size = cb_sz;
+    LAUNCHER3D_TRACE("hook_draw: step create marker cb upload");
+    s.gpu.marker_cb = d->createBuffer(plume::RenderBufferDesc::UploadBuffer(cb_sz, plume::RenderBufferFlag::CONSTANT));
+    s.gpu.marker_cb_size = cb_sz;
+    LAUNCHER3D_TRACE("hook_draw: step create shadow cb upload");
+    s.gpu.shadow_cb = d->createBuffer(plume::RenderBufferDesc::UploadBuffer(shadow_cb_sz, plume::RenderBufferFlag::CONSTANT));
+    s.gpu.shadow_cb_size = shadow_cb_sz;
     LAUNCHER3D_TRACE("hook_draw: step create descriptor set");
     s.gpu.set = s.gpu.set_builder->create(d);
+    LAUNCHER3D_TRACE("hook_draw: step create marker descriptor set");
+    s.gpu.marker_set = s.gpu.set_builder->create(d);
+    LAUNCHER3D_TRACE("hook_draw: step create shadow descriptor set");
+    s.gpu.shadow_set = s.gpu.shadow_set_builder->create(d);
 
-    if (!(s.gpu.vb && s.gpu.ib && s.gpu.cb && s.gpu.set)) {
+    if (!(s.gpu.vb && s.gpu.ib && s.gpu.cb && s.gpu.marker_cb && s.gpu.shadow_cb && s.gpu.set && s.gpu.marker_set && s.gpu.shadow_set)) {
         LAUNCHER3D_TRACE(
-            "hook_draw: resource alloc failed vb=%s ib=%s cb=%s set=%s",
+            "hook_draw: resource alloc failed vb=%s ib=%s cb=%s marker_cb=%s shadow_cb=%s set=%s marker_set=%s shadow_set=%s marker_vb=%s marker_ib=%s",
             yes_no(s.gpu.vb != nullptr),
             yes_no(s.gpu.ib != nullptr),
             yes_no(s.gpu.cb != nullptr),
-            yes_no(s.gpu.set != nullptr)
+            yes_no(s.gpu.marker_cb != nullptr),
+            yes_no(s.gpu.shadow_cb != nullptr),
+            yes_no(s.gpu.set != nullptr),
+            yes_no(s.gpu.marker_set != nullptr),
+            yes_no(s.gpu.shadow_set != nullptr),
+            yes_no(s.gpu.marker_vb != nullptr),
+            yes_no(s.gpu.marker_ib != nullptr)
         );
         return false;
     }
@@ -1425,6 +1756,35 @@ bool create_gpu_resources_if_needed(State& s) {
     std::memcpy(ib_ptr, s.cpu.indices.data(), static_cast<size_t>(ib_sz));
     s.gpu.ib->unmap();
 
+    if (!marker_vertices.empty() && !marker_indices.empty() && s.gpu.marker_vb && s.gpu.marker_ib) {
+        LAUNCHER3D_TRACE("hook_draw: step map/fill marker vb/ib");
+        if (void* marker_vb_ptr = s.gpu.marker_vb->map()) {
+            std::memcpy(marker_vb_ptr, marker_vertices.data(), static_cast<size_t>(marker_vb_sz));
+            s.gpu.marker_vb->unmap();
+            if (void* marker_ib_ptr = s.gpu.marker_ib->map()) {
+                std::memcpy(marker_ib_ptr, marker_indices.data(), static_cast<size_t>(marker_ib_sz));
+                s.gpu.marker_ib->unmap();
+                s.gpu.marker_index_count = marker_indices.size();
+                s.gpu.marker_vb_size = marker_vb_sz;
+                s.gpu.marker_ib_size = marker_ib_sz;
+            } else {
+                s.gpu.marker_index_count = 0;
+                s.gpu.marker_vb_size = 0;
+                s.gpu.marker_ib_size = 0;
+                LAUNCHER3D_TRACE("hook_draw: marker ib map failed, disabling light marker");
+            }
+        } else {
+            s.gpu.marker_index_count = 0;
+            s.gpu.marker_vb_size = 0;
+            s.gpu.marker_ib_size = 0;
+            LAUNCHER3D_TRACE("hook_draw: marker vb map failed, disabling light marker");
+        }
+    } else {
+        s.gpu.marker_index_count = 0;
+        s.gpu.marker_vb_size = 0;
+        s.gpu.marker_ib_size = 0;
+    }
+
     LAUNCHER3D_TRACE("hook_draw: step upload albedo");
     s.gpu.tex_albedo = tex_file(d, s.gpu.copy_q.get(), s.gpu.copy_l.get(), s.gpu.copy_f.get(), s.gpu.upload, s.cpu.albedo, { 255, 255, 255, 255 });
     LAUNCHER3D_TRACE("hook_draw: step upload normal");
@@ -1441,15 +1801,26 @@ bool create_gpu_resources_if_needed(State& s) {
         );
         return false;
     }
+    if (!ensure_shadow_fallback_texture(s)) {
+        LAUNCHER3D_TRACE("hook_draw: shadow fallback texture creation failed");
+        return false;
+    }
 
     LAUNCHER3D_TRACE("hook_draw: step bind descriptor resources");
     s.gpu.set->setBuffer(s.gpu.cb_idx, s.gpu.cb.get(), s.gpu.cb_size);
     s.gpu.set->setTexture(s.gpu.a_idx, s.gpu.tex_albedo.get(), plume::RenderTextureLayout::SHADER_READ);
     s.gpu.set->setTexture(s.gpu.n_idx, s.gpu.tex_normal.get(), plume::RenderTextureLayout::SHADER_READ);
     s.gpu.set->setTexture(s.gpu.s_idx, s.gpu.tex_spec.get(), plume::RenderTextureLayout::SHADER_READ);
+    s.gpu.set->setTexture(s.gpu.shadow_idx, s.gpu.tex_shadow_fallback.get(), plume::RenderTextureLayout::SHADER_READ);
+    s.gpu.marker_set->setBuffer(s.gpu.cb_idx, s.gpu.marker_cb.get(), s.gpu.marker_cb_size);
+    s.gpu.marker_set->setTexture(s.gpu.a_idx, s.gpu.tex_albedo.get(), plume::RenderTextureLayout::SHADER_READ);
+    s.gpu.marker_set->setTexture(s.gpu.n_idx, s.gpu.tex_normal.get(), plume::RenderTextureLayout::SHADER_READ);
+    s.gpu.marker_set->setTexture(s.gpu.s_idx, s.gpu.tex_spec.get(), plume::RenderTextureLayout::SHADER_READ);
+    s.gpu.marker_set->setTexture(s.gpu.shadow_idx, s.gpu.tex_shadow_fallback.get(), plume::RenderTextureLayout::SHADER_READ);
+    s.gpu.shadow_set->setBuffer(s.gpu.shadow_cb_idx, s.gpu.shadow_cb.get(), s.gpu.shadow_cb_size);
     s.gpu.index_count = s.cpu.indices.size();
     s.gpu.ready = true;
-    LAUNCHER3D_TRACE("hook_draw: GPU resources ready index_count=%zu", s.gpu.index_count);
+    LAUNCHER3D_TRACE("hook_draw: GPU resources ready index_count=%zu marker_index_count=%zu", s.gpu.index_count, s.gpu.marker_index_count);
     return true;
 }
 
@@ -1522,18 +1893,64 @@ bool record_model_draw(State& s, plume::RenderCommandList* list, plume::RenderFr
 
     Constants c{};
     c.model = TRS(tr);
+
+    V3 camera_pos{ 0.0f, 0.0f, kCameraZ };
+    V3 camera_target{ 0.0f, 0.0f, 0.0f };
+    float fov_deg = 55.0f;
+#if !defined(NDEBUG)
+    if (s.panel.free_camera_enabled) {
+        camera_target = { s.panel.camera_target_x, s.panel.camera_target_y, s.panel.camera_target_z };
+        camera_pos = camera_from_orbit(
+            s.panel.camera_yaw_deg,
+            std::clamp(s.panel.camera_pitch_deg, -89.0f, 89.0f),
+            std::max(0.2f, s.panel.camera_distance),
+            camera_target
+        );
+        fov_deg = std::clamp(s.panel.camera_fov_deg, 20.0f, 110.0f);
+    }
+#endif
+
     c.view_proj = Mul(
-        LookAt({ 0, 0, kCameraZ }, { 0, 0, 0 }, { 0, 1, 0 }),
-        P(55.0f * (std::numbers::pi_v<float> / 180.0f), static_cast<float>(w) / static_cast<float>(h), 0.01f, 100.0f)
+        LookAt(camera_pos, camera_target, { 0, 1, 0 }),
+        P(fov_deg * (std::numbers::pi_v<float> / 180.0f), static_cast<float>(w) / static_cast<float>(h), 0.01f, 100.0f)
     );
     const V4 center_ws = mul_row_vec({ 0.0f, 0.0f, 0.0f, 1.0f }, c.model);
     s.last_clip_center = mul_row_vec(center_ws, c.view_proj);
     c.light_pos_range = { s.cfg.light.position_ws.x, s.cfg.light.position_ws.y, s.cfg.light.position_ws.z, s.cfg.light.range };
     c.light_dir_intensity = { s.cfg.light.direction_ws.x, s.cfg.light.direction_ws.y, s.cfg.light.direction_ws.z, s.cfg.light.intensity };
     c.light_color_ambient = { s.cfg.light.color.x, s.cfg.light.color.y, s.cfg.light.color.z, s.cfg.light.ambient_intensity };
-    c.camera_spec = { 0, 0, kCameraZ, s.cpu.spec_factor };
+    c.camera_spec = { camera_pos.x, camera_pos.y, camera_pos.z, s.cpu.spec_factor };
     c.base_color = s.cpu.base_color;
     c.spec_color = s.cpu.spec_color;
+    c.shadow_params0 = { 0.0f, 0.0f, 0.0f, 0.0f };
+    c.shadow_params1 = { 0.0f, 0.0f, 1.0f, 0.0f };
+    set_identity_shadow_matrices(c);
+
+    const bool shadow_enabled = shadows_requested(s) && s.shadow.resources_ready && (s.gpu.tex_shadow != nullptr);
+    plume::RenderTexture* shadow_tex = shadow_enabled ? s.gpu.tex_shadow.get() : s.gpu.tex_shadow_fallback.get();
+    if (shadow_tex == nullptr) {
+        s.pipeline_diag = "Shadow texture missing";
+        return false;
+    }
+    const float inv_shadow_res = (s.shadow.effective_resolution > 0U) ? (1.0f / static_cast<float>(s.shadow.effective_resolution)) : 0.0f;
+    if (shadow_enabled) {
+        const ShadowPlanes planes = compute_shadow_planes(s, tr);
+        const float mode = (s.shadow.active_mode == ActiveShadowMode::PointAtlas) ? 1.0f : 2.0f;
+        c.shadow_params0 = {
+            std::clamp(s.cfg.shadow.strength, 0.0f, 1.0f),
+            std::max(0.0f, s.cfg.shadow.depth_bias),
+            std::max(0.0f, s.cfg.shadow.normal_bias),
+            std::max(0.1f, s.cfg.shadow.softness)
+        };
+        c.shadow_params1 = { mode, planes.near_plane, planes.far_plane, inv_shadow_res };
+        if (s.shadow.active_mode == ActiveShadowMode::Spot) {
+            c.shadow_view_proj[0] = compute_spot_shadow_view_proj(s, tr, planes);
+        } else if (s.shadow.active_mode == ActiveShadowMode::PointAtlas) {
+            for (uint32_t face_index = 0; face_index < kShadowFaceCount; ++face_index) {
+                c.shadow_view_proj[face_index] = compute_point_shadow_view_proj(s, face_index, planes);
+            }
+        }
+    }
 
     void* cb_ptr = s.gpu.cb->map();
     if (cb_ptr == nullptr) {
@@ -1545,15 +1962,20 @@ bool record_model_draw(State& s, plume::RenderCommandList* list, plume::RenderFr
     std::memcpy(cb_ptr, &c, sizeof(c));
     s.gpu.cb->unmap();
 
-    plume::RenderTextureBarrier barriers[] = {
+    std::array<plume::RenderTextureBarrier, 4> barriers = {{
         { s.gpu.tex_albedo.get(), plume::RenderTextureLayout::SHADER_READ },
         { s.gpu.tex_normal.get(), plume::RenderTextureLayout::SHADER_READ },
-        { s.gpu.tex_spec.get(), plume::RenderTextureLayout::SHADER_READ }
-    };
-    list->barriers(plume::RenderBarrierStage::GRAPHICS, barriers, static_cast<uint32_t>(std::size(barriers)));
+        { s.gpu.tex_spec.get(), plume::RenderTextureLayout::SHADER_READ },
+        { shadow_tex, plume::RenderTextureLayout::SHADER_READ }
+    }};
+    list->barriers(plume::RenderBarrierStage::GRAPHICS, barriers.data(), static_cast<uint32_t>(barriers.size()));
 
     list->setGraphicsPipelineLayout(s.gpu.layout.get());
     list->setPipeline(s.gpu.pipeline.get());
+    s.gpu.set->setTexture(s.gpu.a_idx, s.gpu.tex_albedo.get(), plume::RenderTextureLayout::SHADER_READ);
+    s.gpu.set->setTexture(s.gpu.n_idx, s.gpu.tex_normal.get(), plume::RenderTextureLayout::SHADER_READ);
+    s.gpu.set->setTexture(s.gpu.s_idx, s.gpu.tex_spec.get(), plume::RenderTextureLayout::SHADER_READ);
+    s.gpu.set->setTexture(s.gpu.shadow_idx, shadow_tex, plume::RenderTextureLayout::SHADER_READ);
     list->setGraphicsDescriptorSet(s.gpu.set.get(), 0);
     list->setViewports(plume::RenderViewport{ 0, 0, static_cast<float>(w), static_cast<float>(h) });
     list->setScissors(plume::RenderRect{ 0, 0, static_cast<int32_t>(w), static_cast<int32_t>(h) });
@@ -1563,6 +1985,44 @@ bool record_model_draw(State& s, plume::RenderCommandList* list, plume::RenderFr
     list->setVertexBuffers(0, &vbv, 1, &s.gpu.slot);
     list->setIndexBuffer(&ibv);
     list->drawIndexedInstanced(static_cast<uint32_t>(s.gpu.index_count), 1, 0, 0, 0);
+
+#if !defined(NDEBUG)
+    if (s.panel.show_light_marker && (s.gpu.marker_index_count > 0) && s.gpu.marker_vb && s.gpu.marker_ib && s.gpu.marker_cb && s.gpu.marker_set) {
+        Transform marker_tr{};
+        marker_tr.position = { s.cfg.light.position_ws.x, s.cfg.light.position_ws.y, s.cfg.light.position_ws.z };
+        const float gizmo_scale = std::clamp(s.panel.light_marker_scale, 0.05f, 8.0f);
+        marker_tr.scale = { gizmo_scale, gizmo_scale, gizmo_scale };
+
+        Constants marker_c = c;
+        marker_c.model = TRS(marker_tr);
+        marker_c.base_color = { 1.0f, 0.92f, 0.18f, 1.0f };
+        marker_c.spec_color = { 1.0f, 0.95f, 0.4f, 1.0f };
+        marker_c.camera_spec.w = 0.28f;
+        marker_c.shadow_params0 = { 0.0f, 0.0f, 0.0f, 0.0f };
+        marker_c.shadow_params1 = { 0.0f, 0.0f, 1.0f, 0.0f };
+        set_identity_shadow_matrices(marker_c);
+
+        if (void* marker_cb_ptr = s.gpu.marker_cb->map()) {
+                std::memcpy(marker_cb_ptr, &marker_c, sizeof(marker_c));
+                s.gpu.marker_cb->unmap();
+
+                plume::RenderVertexBufferView marker_vbv(
+                    s.gpu.marker_vb.get(),
+                    s.gpu.marker_vb_size
+                );
+                plume::RenderIndexBufferView marker_ibv(
+                    s.gpu.marker_ib.get(),
+                    s.gpu.marker_ib_size,
+                    plume::RenderFormat::R32_UINT
+                );
+                s.gpu.marker_set->setTexture(s.gpu.shadow_idx, shadow_tex, plume::RenderTextureLayout::SHADER_READ);
+                list->setGraphicsDescriptorSet(s.gpu.marker_set.get(), 0);
+                list->setVertexBuffers(0, &marker_vbv, 1, &s.gpu.slot);
+                list->setIndexBuffer(&marker_ibv);
+                list->drawIndexedInstanced(static_cast<uint32_t>(s.gpu.marker_index_count), 1, 0, 0, 0);
+            }
+        }
+#endif
     return true;
 }
 
@@ -1680,6 +2140,11 @@ void hook_draw(plume::RenderCommandList* list, plume::RenderFramebuffer* fb){
 
             s.last_draw_attempted = true;
             const Transform tr = compute_current_transform(s);
+            if (!update_shadows_if_needed(s, list, tr)) {
+                s.shadow.active_mode = ActiveShadowMode::Disabled;
+                s.shadow.resources_ready = false;
+                mark_shadow_dirty(s, "Shadow runtime fallback");
+            }
             if (!record_model_draw(s, list, fb, tr)) {
                 s.last_draw_attempted = false;
                 s.trace_frames_skipped++;
@@ -1793,6 +2258,8 @@ void reset_state_for_reconfigure(State& s, const Config& cfg) {
     s.cpu = {};
     reset_intro_locked(s);
     clear_gpu(s);
+    s.shadow = {};
+    s.shadow.dirty = true;
 }
 
 bool validate_config(const Config& cfg) {
@@ -1825,6 +2292,14 @@ Config sanitize_config(const Config& cfg) {
     out.intro.duration_sec = std::max(0.05f, out.intro.duration_sec);
     out.intro.overshoot = std::clamp(out.intro.overshoot, 0.0f, 1.0f);
     out.intro.damping = std::max(0.0f, out.intro.damping);
+
+    out.shadow.resolution = clamp_shadow_resolution(out.shadow.resolution);
+    out.shadow.strength = std::clamp(out.shadow.strength, 0.0f, 1.0f);
+    out.shadow.depth_bias = std::max(0.0f, out.shadow.depth_bias);
+    out.shadow.normal_bias = std::max(0.0f, out.shadow.normal_bias);
+    out.shadow.softness = std::max(0.1f, out.shadow.softness);
+    out.shadow.near_plane = std::max(out.shadow.near_plane, kShadowNearPlaneMin);
+    out.shadow.far_plane_override = std::max(0.0f, out.shadow.far_plane_override);
     return out;
 }
 
@@ -1849,6 +2324,19 @@ void log_config_overview(const Config& cfg) {
         cfg.target_transform.scale.x,
         cfg.target_transform.scale.y,
         cfg.target_transform.scale.z
+    );
+    std::fprintf(
+        stdout,
+        "[CellenseresSDK] launcher3d: configure shadow enabled=%s mode=%d res=%u strength=%.3f bias=%.5f nBias=%.4f soft=%.3f near=%.3f farOverride=%.3f\n",
+        yes_no(cfg.shadow.enabled),
+        static_cast<int>(cfg.shadow.mode),
+        cfg.shadow.resolution,
+        cfg.shadow.strength,
+        cfg.shadow.depth_bias,
+        cfg.shadow.normal_bias,
+        cfg.shadow.softness,
+        cfg.shadow.near_plane,
+        cfg.shadow.far_plane_override
     );
     std::fflush(stdout);
 }
@@ -1897,22 +2385,14 @@ void on_launcher_menu_update(recompui::Element* menu_container) {
     ensure_panel(s, menu_container);
     if (s.panel.status) {
         std::ostringstream ss;
-        const float clip_w = std::max(std::abs(s.last_clip_center.w), 1e-6f);
-        const float ndc_x = s.last_clip_center.x / clip_w;
-        const float ndc_y = s.last_clip_center.y / clip_w;
-        const float ndc_z = s.last_clip_center.z / clip_w;
-
-        ss << (s.enabled ? "Enabled" : "Disabled")
-           << " | " << (s.configured ? "Model OK" : "No Model")
-           << " | Draw " << (should_draw(s) ? "Yes" : "No")
+        ss << "Draw " << (should_draw(s) ? "Yes" : "No")
            << " | Pipe " << (s.gpu.pipeline_ok ? "Yes" : "No")
            << " | Ready " << (s.gpu.ready ? "Yes" : "No")
-           << " | Idx " << s.gpu.index_count
-           << " | Try " << (s.last_draw_attempted ? "Yes" : "No")
-           << " | NDC(" << ndc_x << "," << ndc_y << "," << ndc_z << ")"
-           << " | CfgCtx " << (cfg_visible() ? "On" : "Off")
-           << " | " << (s.pipeline_diag.empty() ? "Diag OK" : ("Diag " + s.pipeline_diag))
-           << " | " << ((s.intro_finished && s.cfg.intro.play_once) ? "Intro Done" : "Intro Active");
+           << " | Shadow " << active_shadow_mode_name(s.shadow.active_mode)
+           << "@" << s.shadow.effective_resolution
+           << " | Cam " << (s.panel.free_camera_enabled ? "Free" : "Fixed")
+           << " | Gizmo " << (s.panel.show_light_marker ? "On" : "Off")
+           << " | Intro " << ((s.intro_finished && s.cfg.intro.play_once) ? "Done" : "Active");
 
         s.panel.status->set_text(ss.str());
     }
@@ -1925,6 +2405,7 @@ void reset_intro() {
     State& s = st();
     std::lock_guard l(s.mx);
     reset_intro_locked(s);
+    mark_shadow_dirty(s);
 }
 
 void shutdown() {
@@ -1965,6 +2446,25 @@ std::string make_cpp_initializer_snippet() {
     o << "        .ambient_intensity = " << c.light.ambient_intensity << "f,\n";
     o << "    },\n";
     o << "    .intro = { .duration_sec = " << c.intro.duration_sec << "f, .overshoot = " << c.intro.overshoot << "f, .damping = " << c.intro.damping << "f, .play_once = " << (c.intro.play_once?"true":"false") << " },\n";
+    o << "    .shadow = {\n";
+    o << "        .enabled = " << (c.shadow.enabled ? "true" : "false") << ",\n";
+    o << "        .mode = csdk::launcher3d::ShadowMode::";
+    if (c.shadow.mode == ShadowMode::SpotOnly) {
+        o << "SpotOnly";
+    } else if (c.shadow.mode == ShadowMode::Disabled) {
+        o << "Disabled";
+    } else {
+        o << "PointCubePreferred";
+    }
+    o << ",\n";
+    o << "        .resolution = " << c.shadow.resolution << ",\n";
+    o << "        .strength = " << c.shadow.strength << "f,\n";
+    o << "        .depth_bias = " << c.shadow.depth_bias << "f,\n";
+    o << "        .normal_bias = " << c.shadow.normal_bias << "f,\n";
+    o << "        .softness = " << c.shadow.softness << "f,\n";
+    o << "        .near_plane = " << c.shadow.near_plane << "f,\n";
+    o << "        .far_plane_override = " << c.shadow.far_plane_override << "f,\n";
+    o << "    },\n";
     o << "    .visible_only_on_title_screen = " << (c.visible_only_on_title_screen?"true":"false") << ",\n";
     o << "};\n";
     return o.str();
