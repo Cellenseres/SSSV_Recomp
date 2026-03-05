@@ -1,6 +1,5 @@
 #include "cs_sdk/launcher_model3d.h"
 
-#include "base/ui_launcher.h"
 #include "core/ui_context.h"
 #include "elements/ui_button.h"
 #include "elements/ui_clickable.h"
@@ -17,6 +16,13 @@
 #ifdef _WIN32
 #include "plume_d3d12.h"
 #endif
+#if !defined(__APPLE__)
+#include "plume_vulkan.h"
+#endif
+#if defined(__APPLE__)
+#include "plume_metal.h"
+#include "plume_vulkan.h"
+#endif
 
 #define CGLTF_IMPLEMENTATION
 #include "cgltf.h"
@@ -32,6 +38,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <numbers>
@@ -990,13 +997,63 @@ bool should_draw(const State& s){
     return draw_decision(s).draw;
 }
 
+struct PrimaryColorAttachment {
+    const plume::RenderTexture* texture = nullptr;
+    const plume::RenderTextureView* texture_view = nullptr;
+    plume::RenderMultisampling multisampling{};
+};
+
+bool try_get_primary_color_attachment(const plume::RenderFramebuffer* src_fb, PrimaryColorAttachment& out) {
+    if (src_fb == nullptr) {
+        return false;
+    }
+
+#ifdef _WIN32
+    if (const auto* d3d_fb = dynamic_cast<const plume::D3D12Framebuffer*>(src_fb)) {
+        if (!d3d_fb->colorTargets.empty() && (d3d_fb->colorTargets[0] != nullptr)) {
+            out.texture = d3d_fb->colorTargets[0];
+            out.multisampling = d3d_fb->colorTargets[0]->desc.multisampling;
+            return true;
+        }
+    }
+#endif
+
+    if (const auto* vk_fb = dynamic_cast<const plume::VulkanFramebuffer*>(src_fb)) {
+        if (!vk_fb->colorAttachments.empty() && (vk_fb->colorAttachments[0] != nullptr)) {
+            out.texture = vk_fb->colorAttachments[0];
+            out.multisampling = vk_fb->colorAttachments[0]->desc.multisampling;
+            return true;
+        }
+    }
+
+#if defined(__APPLE__)
+    if (const auto* metal_fb = dynamic_cast<const plume::MetalFramebuffer*>(src_fb)) {
+        if (!metal_fb->colorAttachments.empty()) {
+            const plume::MetalAttachment& attachment = metal_fb->colorAttachments[0];
+            out.multisampling = plume::RenderMultisampling(attachment.sampleCount);
+            if (attachment.texture != nullptr) {
+                out.texture = attachment.texture;
+                return true;
+            }
+
+            if (attachment.textureView != nullptr) {
+                out.texture_view = attachment.textureView;
+                return true;
+            }
+        }
+    }
+#endif
+
+    return false;
+}
+
 plume::RenderFramebuffer* resolve_framebuffer_for_3d_pass(State& s, plume::RenderFramebuffer* src_fb, plume::RenderCommandList* list){
     if((src_fb == nullptr) || !s.gpu.pipeline_uses_depth || (s.gpu.pipeline_depth_format == plume::RenderFormat::UNKNOWN)){
         return src_fb;
     }
-#ifdef _WIN32
-    auto* d3d_src_fb = dynamic_cast<plume::D3D12Framebuffer*>(src_fb);
-    if((d3d_src_fb == nullptr) || d3d_src_fb->colorTargets.empty()){
+
+    PrimaryColorAttachment color_attachment{};
+    if (!try_get_primary_color_attachment(src_fb, color_attachment)) {
         return src_fb;
     }
 
@@ -1004,14 +1061,12 @@ plume::RenderFramebuffer* resolve_framebuffer_for_3d_pass(State& s, plume::Rende
         s.gpu.fb_with_depth_by_src_fb.erase(src_fb);
         s.gpu.depth_by_src_fb.erase(src_fb);
 
-        const plume::D3D12Texture* color_tex = d3d_src_fb->colorTargets[0];
-        plume::RenderMultisampling ms = color_tex->desc.multisampling;
         auto depth_tex = s.gpu.dev->createTexture(
             plume::RenderTextureDesc::DepthTarget(
                 src_fb->getWidth(),
                 src_fb->getHeight(),
                 s.gpu.pipeline_depth_format,
-                ms
+                color_attachment.multisampling
             )
         );
         if(!depth_tex){
@@ -1021,8 +1076,20 @@ plume::RenderFramebuffer* resolve_framebuffer_for_3d_pass(State& s, plume::Rende
             return false;
         }
 
-        const plume::RenderTexture* color_attachment = color_tex;
-        plume::RenderFramebufferDesc fb_desc(&color_attachment, 1, depth_tex.get(), false);
+        plume::RenderFramebufferDesc fb_desc{};
+        const plume::RenderTexture* color_texture_ptr = color_attachment.texture;
+        const plume::RenderTextureView* color_view_ptr = color_attachment.texture_view;
+        if (color_texture_ptr != nullptr) {
+            fb_desc.colorAttachments = &color_texture_ptr;
+            fb_desc.colorAttachmentsCount = 1;
+        } else if (color_view_ptr != nullptr) {
+            fb_desc.colorAttachmentViews = &color_view_ptr;
+            fb_desc.colorAttachmentsCount = 1;
+        } else {
+            return false;
+        }
+        fb_desc.depthAttachment = depth_tex.get();
+        fb_desc.depthAttachmentReadOnly = false;
         auto depth_fb = s.gpu.dev->createFramebuffer(fb_desc);
         if(!depth_fb){
             LAUNCHER3D_TRACE("resolve_framebuffer_for_3d_pass: framebuffer creation failed, fallback without depth");
@@ -1059,10 +1126,6 @@ plume::RenderFramebuffer* resolve_framebuffer_for_3d_pass(State& s, plume::Rende
     plume::RenderTextureBarrier depth_barrier(depth_tex_it->second.get(), plume::RenderTextureLayout::DEPTH_WRITE);
     list->barriers(plume::RenderBarrierStage::GRAPHICS, &depth_barrier, 1);
     return depth_fb_it->second.get();
-#else
-    (void)list;
-    return src_fb;
-#endif
 }
 
 #if !defined(NDEBUG)
@@ -1129,10 +1192,9 @@ recompui::Slider* mk_slider(
     sld->add_value_changed_callback(cb);
     return sld;
 }
-void ensure_panel(State& s,recompui::LauncherMenu* menu){
-    if(s.panel.built||!menu) return;
-    auto* mc=menu->get_menu_container();
-    if(!mc) return;
+void ensure_panel(State& s,recompui::Element* menu_container){
+    if(s.panel.built||!menu_container) return;
+    auto* mc=menu_container;
 
     auto c=recompui::get_current_context();
     s.panel.root=c.create_element<recompui::Element>(mc);
@@ -1151,11 +1213,12 @@ void ensure_panel(State& s,recompui::LauncherMenu* menu){
     h->set_width(100.0f, recompui::Unit::Percent);
     h->set_margin_bottom(6);
     h->add_dragged_callback([&s](float x, float y, recompui::DragPhase phase){
-        if(!s.panel.root){
-            return;
-        }
-
         if(phase == recompui::DragPhase::Start){
+            std::lock_guard lock(s.mx);
+            if(!s.panel.root){
+                return;
+            }
+
             s.panel.drag_start_mouse_x = x;
             s.panel.drag_start_mouse_y = y;
             s.panel.drag_start_left_dp = s.panel.left_dp;
@@ -1167,14 +1230,32 @@ void ensure_panel(State& s,recompui::LauncherMenu* menu){
             return;
         }
 
-        const float dp_to_px = std::max(s.panel.root->get_dp_to_pixel_ratio(), 0.001f);
-        float new_left_dp = s.panel.drag_start_left_dp + ((x - s.panel.drag_start_mouse_x) / dp_to_px);
-        float new_top_dp = s.panel.drag_start_top_dp + ((y - s.panel.drag_start_mouse_y) / dp_to_px);
+        recompui::Element* root = nullptr;
+        float drag_start_left_dp = 0.0f;
+        float drag_start_top_dp = 0.0f;
+        float drag_start_mouse_x = 0.0f;
+        float drag_start_mouse_y = 0.0f;
+        {
+            std::lock_guard lock(s.mx);
+            root = s.panel.root;
+            if(!root){
+                return;
+            }
 
-        if(auto* parent = s.panel.root->get_parent()){
+            drag_start_left_dp = s.panel.drag_start_left_dp;
+            drag_start_top_dp = s.panel.drag_start_top_dp;
+            drag_start_mouse_x = s.panel.drag_start_mouse_x;
+            drag_start_mouse_y = s.panel.drag_start_mouse_y;
+        }
+
+        const float dp_to_px = std::max(root->get_dp_to_pixel_ratio(), 0.001f);
+        float new_left_dp = drag_start_left_dp + ((x - drag_start_mouse_x) / dp_to_px);
+        float new_top_dp = drag_start_top_dp + ((y - drag_start_mouse_y) / dp_to_px);
+
+        if(auto* parent = root->get_parent()){
             const float parent_w = parent->get_client_width();
             const float parent_h = parent->get_client_height();
-            const float panel_w = s.panel.root->get_client_width();
+            const float panel_w = root->get_client_width();
             if((parent_w > 0.0f) && (panel_w > 0.0f)){
                 const float min_left = 16.0f - panel_w;
                 const float max_left = parent_w - 16.0f;
@@ -1187,10 +1268,14 @@ void ensure_panel(State& s,recompui::LauncherMenu* menu){
             }
         }
 
-        s.panel.left_dp = new_left_dp;
-        s.panel.top_dp = new_top_dp;
-        s.panel.root->set_left(s.panel.left_dp);
-        s.panel.root->set_top(s.panel.top_dp);
+        {
+            std::lock_guard lock(s.mx);
+            s.panel.left_dp = new_left_dp;
+            s.panel.top_dp = new_top_dp;
+        }
+
+        root->set_left(new_left_dp);
+        root->set_top(new_top_dp);
     });
 
     c.create_element<recompui::Label>(h, "3D Debug", recompui::LabelStyle::Small);
@@ -1200,46 +1285,56 @@ void ensure_panel(State& s,recompui::LauncherMenu* menu){
     s.panel.content->set_flex_direction(recompui::FlexDirection::Column);
     s.panel.content->display_hide();
     tgl->add_pressed_callback([&s, tgl]() {
-        s.panel.open = !s.panel.open;
-        tgl->set_text(s.panel.open ? "Close" : "Open");
-        if (s.panel.open) {
-            s.panel.content->display_show();
+        bool open = false;
+        recompui::Element* content = nullptr;
+        {
+            std::lock_guard lock(s.mx);
+            s.panel.open = !s.panel.open;
+            open = s.panel.open;
+            content = s.panel.content;
         }
-        else {
-            s.panel.content->display_hide();
+
+        tgl->set_text(open ? "Close" : "Open");
+        if (content != nullptr) {
+            if (open) {
+                content->display_show();
+            } else {
+                content->display_hide();
+            }
         }
     });
     s.panel.status = c.create_element<recompui::Label>(s.panel.content, "Status", recompui::LabelStyle::Annotation);
     s.panel.status->set_margin_bottom(4);
-    const auto add_float_slider = [&](const std::string& title, double min_value, double max_value, double step_value, float& target) {
-        mk_slider(s.panel.content, title, min_value, max_value, step_value, target, [&target](double v) {
-            target = static_cast<float>(v);
+    const auto add_float_slider = [&](const std::string& title, double min_value, double max_value, double step_value, float initial, const std::function<void(float)>& setter) {
+        mk_slider(s.panel.content, title, min_value, max_value, step_value, initial, [setter](double v) {
+            setter(static_cast<float>(v));
         });
     };
 
-    add_float_slider("Pos X", -6.0, 6.0, 0.01, s.cfg.target_transform.position.x);
-    add_float_slider("Pos Y", -6.0, 6.0, 0.01, s.cfg.target_transform.position.y);
-    add_float_slider("Pos Z", -12.0, 4.0, 0.01, s.cfg.target_transform.position.z);
-    add_float_slider("Rot X", -180.0, 180.0, 0.1, s.cfg.target_transform.rotation_deg.pitch);
-    add_float_slider("Rot Y", -180.0, 180.0, 0.1, s.cfg.target_transform.rotation_deg.yaw);
-    add_float_slider("Rot Z", -180.0, 180.0, 0.1, s.cfg.target_transform.rotation_deg.roll);
+    add_float_slider("Pos X", -6.0, 6.0, 0.01, s.cfg.target_transform.position.x, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.position.x = v; });
+    add_float_slider("Pos Y", -6.0, 6.0, 0.01, s.cfg.target_transform.position.y, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.position.y = v; });
+    add_float_slider("Pos Z", -12.0, 4.0, 0.01, s.cfg.target_transform.position.z, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.position.z = v; });
+    add_float_slider("Rot X", -180.0, 180.0, 0.1, s.cfg.target_transform.rotation_deg.pitch, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.rotation_deg.pitch = v; });
+    add_float_slider("Rot Y", -180.0, 180.0, 0.1, s.cfg.target_transform.rotation_deg.yaw, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.rotation_deg.yaw = v; });
+    add_float_slider("Rot Z", -180.0, 180.0, 0.1, s.cfg.target_transform.rotation_deg.roll, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.target_transform.rotation_deg.roll = v; });
 
     mk_slider(s.panel.content, "Scale", 0.01, 4.0, 0.01, s.cfg.target_transform.scale.x, [&s](double v) {
         const float uniform_scale = static_cast<float>(v);
+        std::lock_guard lock(s.mx);
         s.cfg.target_transform.scale = { uniform_scale, uniform_scale, uniform_scale };
     });
-    add_float_slider("Light X", -10.0, 10.0, 0.01, s.cfg.light.position_ws.x);
-    add_float_slider("Light Y", -10.0, 10.0, 0.01, s.cfg.light.position_ws.y);
-    add_float_slider("Light Z", -10.0, 10.0, 0.01, s.cfg.light.position_ws.z);
-    add_float_slider("Light Range", 0.1, 50.0, 0.1, s.cfg.light.range);
-    add_float_slider("Light Int", 0.0, 10.0, 0.01, s.cfg.light.intensity);
-    add_float_slider("Ambient", 0.0, 2.0, 0.01, s.cfg.light.ambient_intensity);
-    add_float_slider("Light R", 0.0, 4.0, 0.01, s.cfg.light.color.x);
-    add_float_slider("Light G", 0.0, 4.0, 0.01, s.cfg.light.color.y);
-    add_float_slider("Light B", 0.0, 4.0, 0.01, s.cfg.light.color.z);
-    add_float_slider("Intro Time", 0.1, 8.0, 0.01, s.cfg.intro.duration_sec);
-    add_float_slider("Overshoot", 0.0, 1.0, 0.01, s.cfg.intro.overshoot);
-    add_float_slider("Damping", 0.0, 20.0, 0.05, s.cfg.intro.damping);
+    add_float_slider("Light X", -10.0, 10.0, 0.01, s.cfg.light.position_ws.x, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.position_ws.x = v; });
+    add_float_slider("Light Y", -10.0, 10.0, 0.01, s.cfg.light.position_ws.y, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.position_ws.y = v; });
+    add_float_slider("Light Z", -10.0, 10.0, 0.01, s.cfg.light.position_ws.z, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.position_ws.z = v; });
+    add_float_slider("Light Range", 0.1, 50.0, 0.1, s.cfg.light.range, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.range = v; });
+    add_float_slider("Light Int", 0.0, 10.0, 0.01, s.cfg.light.intensity, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.intensity = v; });
+    add_float_slider("Ambient", 0.0, 2.0, 0.01, s.cfg.light.ambient_intensity, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.ambient_intensity = v; });
+    add_float_slider("Light R", 0.0, 4.0, 0.01, s.cfg.light.color.x, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.color.x = v; });
+    add_float_slider("Light G", 0.0, 4.0, 0.01, s.cfg.light.color.y, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.color.y = v; });
+    add_float_slider("Light B", 0.0, 4.0, 0.01, s.cfg.light.color.z, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.light.color.z = v; });
+    add_float_slider("Intro Time", 0.1, 8.0, 0.01, s.cfg.intro.duration_sec, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.intro.duration_sec = v; });
+    add_float_slider("Overshoot", 0.0, 1.0, 0.01, s.cfg.intro.overshoot, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.intro.overshoot = v; });
+    add_float_slider("Damping", 0.0, 20.0, 0.05, s.cfg.intro.damping, [&s](float v) { std::lock_guard lock(s.mx); s.cfg.intro.damping = v; });
     auto* row = c.create_element<recompui::Element>(s.panel.content);
     row->set_display(recompui::Display::Flex);
     row->set_flex_direction(recompui::FlexDirection::Row);
@@ -1247,6 +1342,7 @@ void ensure_panel(State& s,recompui::LauncherMenu* menu){
 
     auto* b_reset_pose = c.create_element<recompui::Button>(row, "Reset Pose", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Small);
     b_reset_pose->add_pressed_callback([&s]() {
+        std::lock_guard lock(s.mx);
         s.cfg.target_transform = s.cfg_initial.target_transform;
     });
 
@@ -1759,11 +1855,7 @@ void log_config_overview(const Config& cfg) {
 #endif
 
 bool configure(const Config& cfg) {
-    State& s = st();
-    std::lock_guard l(s.mx);
     const Config sanitized_cfg = sanitize_config(cfg);
-
-    reset_state_for_reconfigure(s, sanitized_cfg);
 #if !defined(NDEBUG)
     log_config_overview(sanitized_cfg);
 #endif
@@ -1772,16 +1864,21 @@ bool configure(const Config& cfg) {
         return false;
     }
 
+    CpuModel loaded_cpu{};
     std::string err;
-    if (!load_glb(sanitized_cfg.glb_path, s.cpu, err)) {
+    if (!load_glb(sanitized_cfg.glb_path, loaded_cpu, err)) {
         std::fprintf(stderr, "[CellenseresSDK] launcher3d: load failed: %s\n", err.c_str());
         return false;
     }
 
 #if !defined(NDEBUG)
-    log_loaded_model_info(sanitized_cfg, s.cpu);
+    log_loaded_model_info(sanitized_cfg, loaded_cpu);
 #endif
 
+    State& s = st();
+    std::lock_guard l(s.mx);
+    reset_state_for_reconfigure(s, sanitized_cfg);
+    s.cpu = std::move(loaded_cpu);
     s.enabled = true;
     s.configured = true;
     return true;
@@ -1793,11 +1890,11 @@ void set_enabled(bool enabled) {
     s.enabled = enabled && s.configured;
 }
 
-void on_launcher_menu_update(recompui::LauncherMenu* menu) {
+void on_launcher_menu_update(recompui::Element* menu_container) {
     State& s = st();
     std::lock_guard l(s.mx);
 #if !defined(NDEBUG)
-    ensure_panel(s, menu);
+    ensure_panel(s, menu_container);
     if (s.panel.status) {
         std::ostringstream ss;
         const float clip_w = std::max(std::abs(s.last_clip_center.w), 1e-6f);
@@ -1820,7 +1917,7 @@ void on_launcher_menu_update(recompui::LauncherMenu* menu) {
         s.panel.status->set_text(ss.str());
     }
 #else
-    (void)menu;
+    (void)menu_container;
 #endif
 }
 

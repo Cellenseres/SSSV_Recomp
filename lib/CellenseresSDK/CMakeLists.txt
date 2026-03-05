@@ -52,6 +52,9 @@ target_include_directories(cellenseres_sdk
         ${CMAKE_BINARY_DIR}/shaders
         ${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib
         ${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/plume
+        ${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/plume/contrib/volk
+        ${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/plume/contrib/VulkanMemoryAllocator/include
+        ${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/plume/contrib/Vulkan-Headers/include
         ${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/plume/contrib/D3D12MemoryAllocator/include
         ${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/hlslpp/include
         ${PROJECT_SOURCE_DIR}/lib/rt64/src

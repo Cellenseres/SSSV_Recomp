@@ -108,7 +108,7 @@ bool title_model_intro_gate_open = false;
 struct Launcher3DMenuUpdateScope {
     explicit Launcher3DMenuUpdateScope(recompui::LauncherMenu* menu_in) : menu(menu_in) {}
     ~Launcher3DMenuUpdateScope() {
-        csdk::launcher3d::on_launcher_menu_update(menu);
+        csdk::launcher3d::on_launcher_menu_update(menu != nullptr ? menu->get_menu_container() : nullptr);
     }
 
     recompui::LauncherMenu* menu = nullptr;

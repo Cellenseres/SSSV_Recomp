@@ -4,7 +4,7 @@
 #include <string>
 
 namespace recompui {
-    class LauncherMenu;
+    class Element;
 }
 
 namespace csdk::launcher3d {
@@ -54,7 +54,7 @@ namespace csdk::launcher3d {
     void prime_render_backend(void* rhi, void* dev);
     bool configure(const Config& cfg);
     void set_enabled(bool enabled);
-    void on_launcher_menu_update(recompui::LauncherMenu* menu);
+    void on_launcher_menu_update(recompui::Element* menu_container);
     void reset_intro();
     void shutdown();
 

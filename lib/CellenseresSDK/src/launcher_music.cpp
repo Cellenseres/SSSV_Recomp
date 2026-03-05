@@ -4,14 +4,17 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <vector>
 
 namespace csdk::launcher_music {
 namespace {
 struct State {
+    std::mutex mx;
     Config config{};
     Callbacks callbacks{};
     std::vector<float> pcm;
+    std::vector<float> temp_buffer;
     size_t cursor_frames = 0;
     uint32_t pcm_channels = 0;
     bool enabled = false;
@@ -265,15 +268,25 @@ bool callbacks_valid() {
 } // namespace
 
 void init(const Config& config, const Callbacks& callbacks) {
+    std::lock_guard lock(state.mx);
     state.config = config;
     state.callbacks = callbacks;
+    state.pcm.clear();
+    state.temp_buffer.clear();
+    state.cursor_frames = 0;
+    state.pcm_channels = 0;
+    state.loaded = false;
+    state.load_attempted = false;
+    state.playing = false;
 }
 
 void set_enabled(bool enabled) {
+    std::lock_guard lock(state.mx);
     state.enabled = enabled;
 }
 
 void update(float volume) {
+    std::lock_guard lock(state.mx);
     if (!state.enabled || !callbacks_valid()) {
         return;
     }
@@ -313,7 +326,6 @@ void update(float volume) {
 
     volume = std::clamp(volume, 0.0f, 1.0f);
 
-    static std::vector<float> temp;
     uint32_t queued_ms = state.callbacks.get_queued_ms();
     size_t safety = 0;
 
@@ -331,18 +343,18 @@ void update(float volume) {
             continue;
         }
 
-        temp.resize(frames_to_copy * state.pcm_channels);
+        state.temp_buffer.resize(frames_to_copy * state.pcm_channels);
         const float* src = state.pcm.data() + state.cursor_frames * state.pcm_channels;
 
         if (volume >= 0.999f) {
-            std::copy(src, src + temp.size(), temp.begin());
+            std::copy(src, src + state.temp_buffer.size(), state.temp_buffer.begin());
         } else {
-            for (size_t i = 0; i < temp.size(); ++i) {
-                temp[i] = src[i] * volume;
+            for (size_t i = 0; i < state.temp_buffer.size(); ++i) {
+                state.temp_buffer[i] = src[i] * volume;
             }
         }
 
-        if (!state.callbacks.queue_audio(temp.data(), frames_to_copy)) {
+        if (!state.callbacks.queue_audio(state.temp_buffer.data(), frames_to_copy)) {
             break;
         }
 
@@ -356,9 +368,19 @@ void update(float volume) {
 }
 
 void shutdown() {
+    std::lock_guard lock(state.mx);
     if (state.playing && state.callbacks.stop_playback) {
         state.callbacks.stop_playback();
     }
-    state = {};
+    state.config = {};
+    state.callbacks = {};
+    state.pcm.clear();
+    state.temp_buffer.clear();
+    state.cursor_frames = 0;
+    state.pcm_channels = 0;
+    state.enabled = false;
+    state.loaded = false;
+    state.load_attempted = false;
+    state.playing = false;
 }
 } // namespace csdk::launcher_music
