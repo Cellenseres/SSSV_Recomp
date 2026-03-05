@@ -77,5 +77,11 @@ elseif(APPLE OR CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_include_directories(cellenseres_sdk PRIVATE ${SDL2_INCLUDE_DIRS})
 endif()
 
+if(APPLE)
+    target_include_directories(cellenseres_sdk PRIVATE
+        ${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/plume/contrib/metal-cpp
+    )
+endif()
+
 build_vertex_shader(cellenseres_sdk "lib/CellenseresSDK/shaders/LauncherModelVS.hlsl" "shaders/LauncherModelVS.hlsl")
 build_pixel_shader(cellenseres_sdk "lib/CellenseresSDK/shaders/LauncherModelPS.hlsl" "shaders/LauncherModelPS.hlsl")
