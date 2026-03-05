@@ -1,425 +1,603 @@
 #include "sssv_launcher.h"
+
+#include "cs_sdk/launcher_model3d.h"
+#include "cs_sdk/ui_bridge.h"
+#include "recompui/config.h"
+#include "elements/ui_element.h"
+#include "elements/ui_image.h"
+#include "elements/ui_modal.h"
+#include "elements/ui_svg.h"
+#include "util/file.h"
+#include "ultramodern/ultramodern.hpp"
+
 #include <algorithm>
-#include <atomic>
 #include <array>
 #include <chrono>
-#include <cstdlib>
+#include <cmath>
 #include <cstdint>
-#include <ctime>
-#include <string>
+#include <cstdio>
 #include <vector>
 
-struct KeyframeRot {
-    float seconds;
-    float deg;
+namespace {
+class DeterministicRng {
+public:
+    explicit DeterministicRng(uint32_t seed) : state_(seed) {}
+
+    void reset(uint32_t seed) {
+        state_ = seed;
+    }
+
+    uint32_t next_u32() {
+        // Xorshift32 is sufficient here and keeps the sequence stable across runs.
+        state_ ^= state_ << 13;
+        state_ ^= state_ >> 17;
+        state_ ^= state_ << 5;
+        return state_;
+    }
+
+    float next_unit_float() {
+        return static_cast<float>(next_u32() & 0x00FFFFFFu) / static_cast<float>(0x01000000u);
+    }
+
+    float next_range(float min_value, float max_value) {
+        return min_value + (max_value - min_value) * next_unit_float();
+    }
+
+private:
+    uint32_t state_;
 };
 
-struct Keyframe2D {
-    float seconds;
-    float x;
-    float y;
+constexpr uint32_t kAnimationSeed = 0x53535356u;
+constexpr size_t kStarCount = 128;
+constexpr size_t kTrailDots = 6;
+constexpr float kTrailSpacingDp = 11.0f;
+constexpr float kBaseSpeedDp = 42.0f;
+constexpr float kSpeedRangeDp = 170.0f;
+constexpr float kSizeMinDp = 1.1f;
+constexpr float kSizeMaxDp = 6.4f;
+constexpr float kDotSizeMinDp = 0.4f;
+constexpr float kTrailLengthFar = 0.28f;
+constexpr float kTrailScaleMin = 0.24f;
+constexpr float kTrailOpacityMin = 0.16f;
+constexpr float kTrailOpacityMax = 0.92f;
+constexpr float kFixedStepSeconds = 1.0f / 60.0f;
+constexpr float kMaxFrameDeltaSeconds = 0.10f;
+constexpr float kLogoWidthDp = 6187.0f * 0.125f;
+constexpr float kLogoHeightDp = 2625.0f * 0.125f;
+constexpr float kLogoIntroDurationSeconds = 2.0f;
+constexpr float kLogoStartYDp = -900.0f;
+constexpr float kLogoEndYDp = -365.0f;
+constexpr float kLogoDriftAmplitudeDp = 10.0f;
+constexpr float kLogoDriftFrequencyHz = 0.22f;
+constexpr float kTitleBackgroundAssetWidthDp = 1536.0f;
+constexpr float kTitleBackgroundAssetHeightDp = 1024.0f;
+constexpr int kTitleSlideInSteps = 16;
+constexpr float kTitleBouncePhaseStepDegrees = 6.0f;
+
+enum class TitleAnimationPhase {
+    Uninitialized,
+    SlidingIn,
+    Bouncing,
+    Complete,
 };
 
-enum class InterpolationMethod {
-    Linear,
-    Smootherstep
-};
-
-struct AnimationData {
-    uint32_t keyframe_index = 0;
-    uint32_t loop_keyframe_index = UINT32_MAX;
-    float seconds = 0.0f;
-    InterpolationMethod interpolation_method = InterpolationMethod::Linear;
-};
-
-struct AnimatedSvg {
-    recompui::Element *svg = nullptr;
-    std::vector<Keyframe2D> position_keyframes;
-    std::vector<Keyframe2D> scale_keyframes;
-    std::vector<KeyframeRot> rotation_keyframes;
-    AnimationData position_animation;
-    AnimationData scale_animation;
-    AnimationData rotation_animation;
-    float width = 0;
-    float height = 0;
-};
-
-// Starfield: dotted trails, parallax (size/speed by depth)
-static constexpr int STARFIELD_NUM_STARS = 192;
-static constexpr int STARFIELD_TRAIL_DOTS = 8;
-static constexpr float STARFIELD_TRAIL_SPACING_DP = 10.0f;
-static constexpr float STARFIELD_BASE_SPEED_DP = 45.0f;
-static constexpr float STARFIELD_SPEED_RANGE_DP = 200.0f;
-// Far stars (depth 0) use MIN, near stars (depth 1) use MAX – keep MIN small so distant stars look small.
-static constexpr float STARFIELD_SIZE_MIN_DP = 1.2f;
-static constexpr float STARFIELD_SIZE_MAX_DP = 7.2f;
-// Minimum displayed dot size (dp); allow small dots so far stars don’t get clamped too large.
-static constexpr float STARFIELD_DOT_SIZE_MIN_DP = 0.35f;
-// Trail length scale: far stars (depth 0) use this fraction of base spacing → shorter trails; near stars (depth 1) use full spacing.
-static constexpr float STARFIELD_TRAIL_LENGTH_FAR = 0.2f;
-static constexpr float STARFIELD_TRAIL_OPACITY_MAX = 1.0f;
-static constexpr float STARFIELD_TRAIL_OPACITY_MIN = 0.18f;
-
-// Opacity for trail dot index t (0 = front, TRAIL_DOTS-1 = back); linear from max to min.
-static float starfield_trail_opacity(int t) {
-    if (STARFIELD_TRAIL_DOTS <= 1) return STARFIELD_TRAIL_OPACITY_MAX;
-    return STARFIELD_TRAIL_OPACITY_MAX + (STARFIELD_TRAIL_OPACITY_MIN - STARFIELD_TRAIL_OPACITY_MAX) * (float)t / (float)(STARFIELD_TRAIL_DOTS - 1);
-}
-
-// Size scale for trail dot t (0 = front = 1.0, TRAIL_DOTS-1 = back = min); works for any TRAIL_DOTS count.
-static constexpr float STARFIELD_TRAIL_DOT_SCALE_MIN = 0.2f;
-static float starfield_trail_dot_scale(int t) {
-    if (STARFIELD_TRAIL_DOTS <= 1) return 1.0f;
-    return 1.0f - (1.0f - STARFIELD_TRAIL_DOT_SCALE_MIN) * (float)t / (float)(STARFIELD_TRAIL_DOTS - 1);
-}
-
-struct StarfieldStar {
-    float x = 0.0f;
-    float y = 0.0f;
-    float speed_dp = 0.0f;
-    float size_dp = 0.0f;
-    float depth = 0.0f;  // 0 = far (short trail), 1 = near (long trail)
-    recompui::Element* dots[STARFIELD_TRAIL_DOTS] = {};
-};
-
-struct LauncherContext {
-    AnimatedSvg banjo_svg;
-    AnimatedSvg kazooie_svg;
-    AnimatedSvg jiggy_color_svg;
-    AnimatedSvg jiggy_shine_svg;
-    AnimatedSvg jiggy_hole_svg;
-    AnimatedSvg logo_svg;
-    std::array<AnimatedSvg, 4> cloud_svgs;
-    recompui::Element* starfield_wrapper = nullptr;
-    std::vector<StarfieldStar> starfield_stars;
-    recompui::Element* wrapper = nullptr;
-    float wrapper_phase = -1.0f;
-    std::chrono::steady_clock::time_point last_update_time;
-    float seconds = 0.0f;
+struct TitleBackgroundState {
+    recompui::Image* image = nullptr;
+    std::chrono::steady_clock::time_point last_update_time{};
+    float accumulator_seconds = 0.0f;
+    float x_offset_dp = 0.0f;
+    float slide_step_dp = 0.0f;
+    float cover_width_dp = 0.0f;
+    float cover_height_dp = 0.0f;
+    float base_x_dp = 0.0f;
+    float base_y_dp = 0.0f;
+    float last_bg_width_dp = 0.0f;
+    float last_bg_height_dp = 0.0f;
+    float bounce_phase_degrees = 180.0f;
+    int bounce_divisor = 0;
     bool started = false;
-    bool options_enabled = false;
-    std::atomic<bool> animation_skipped = false;
-    std::atomic<bool> skip_animation_next_update = false;
+    TitleAnimationPhase phase = TitleAnimationPhase::Uninitialized;
 };
 
-static LauncherContext launcher_context;
+TitleBackgroundState title_background_state;
+bool config_background_initialized = false;
+bool title_model_configuration_attempted = false;
+bool title_model_active = false;
+bool title_model_intro_gate_open = false;
 
-float interpolate_value(float a, float b, float t, InterpolationMethod method) {
-    switch (method) {
-    case InterpolationMethod::Smootherstep:
-        return a + (b - a) * (t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f));
-    case InterpolationMethod::Linear:
-    default:
-        return a + (b - a) * t;
+struct Launcher3DMenuUpdateScope {
+    explicit Launcher3DMenuUpdateScope(recompui::LauncherMenu* menu_in) : menu(menu_in) {}
+    ~Launcher3DMenuUpdateScope() {
+        csdk::launcher3d::on_launcher_menu_update(menu);
     }
+
+    recompui::LauncherMenu* menu = nullptr;
+};
+
+bool is_title_background_intro_complete() {
+    return title_background_state.phase == TitleAnimationPhase::Complete;
 }
 
-void calculate_rot_from_keyframes(const std::vector<KeyframeRot> &kf, AnimationData &an, float delta_time, float &deg) {
-    if (kf.empty()) {
+void apply_title_model_intro_gate(bool should_open_gate) {
+    if (!title_model_active || should_open_gate == title_model_intro_gate_open) {
         return;
     }
 
-    an.seconds += delta_time;
-
-    while ((an.keyframe_index < (kf.size() - 1) && (an.seconds >= kf[an.keyframe_index + 1].seconds))) {
-        an.keyframe_index++;
-    }
-
-    if (an.keyframe_index >= (kf.size() - 1)) {
-        deg = kf[an.keyframe_index].deg;
-    }
-    else {
-        float t = (an.seconds - kf[an.keyframe_index].seconds) / (kf[an.keyframe_index + 1].seconds - kf[an.keyframe_index].seconds);
-        deg = interpolate_value(kf[an.keyframe_index].deg, kf[an.keyframe_index + 1].deg, t, an.interpolation_method);
+    title_model_intro_gate_open = should_open_gate;
+    csdk::launcher3d::set_enabled(should_open_gate);
+    if (should_open_gate) {
+        csdk::launcher3d::reset_intro();
     }
 }
 
-void calculate_2d_from_keyframes(const std::vector<Keyframe2D> &kf, AnimationData &an, float delta_time, float &x, float &y) {
-    if (kf.empty()) {
-        return;
+bool configure_title_intro_model() {
+    if (title_model_configuration_attempted) {
+        return title_model_active;
     }
 
-    an.seconds += delta_time;
+    title_model_configuration_attempted = true;
 
-    while ((an.keyframe_index < (kf.size() - 1) && (an.seconds >= kf[an.keyframe_index + 1].seconds))) {
-        an.keyframe_index++;
-    }
+    auto make_title_intro_model_config = []() {
+        csdk::launcher3d::Config cfg{};
+        cfg.glb_path = recompui::file::get_asset_path("launcher_intro.glb");
 
-    if ((an.loop_keyframe_index != UINT32_MAX) && (an.keyframe_index >= (kf.size() - 1))) {
-        an.seconds = kf[an.loop_keyframe_index].seconds + (an.seconds - kf[an.keyframe_index].seconds);
-        an.keyframe_index = an.loop_keyframe_index;
-    }
+        cfg.target_transform.position = { 0.000f, 0.930f, 0.180f };
+        cfg.target_transform.rotation_deg = { 11.800f, 180.000f, 0.000f };
+        cfg.target_transform.scale = { 0.620f, 0.620f, 0.620f };
 
-    if (an.keyframe_index >= (kf.size() - 1)) {
-        x = kf[an.keyframe_index].x;
-        y = kf[an.keyframe_index].y;
-    }
-    else {
-        float t = (an.seconds - kf[an.keyframe_index].seconds) / (kf[an.keyframe_index + 1].seconds - kf[an.keyframe_index].seconds);
-        x = interpolate_value(kf[an.keyframe_index].x, kf[an.keyframe_index + 1].x, t, an.interpolation_method);
-        y = interpolate_value(kf[an.keyframe_index].y, kf[an.keyframe_index + 1].y, t, an.interpolation_method);
-    }
-}
+        cfg.light.direction_ws = { -0.200f, -0.800f, -0.500f };
+        cfg.light.position_ws = { 0.050f, 0.250f, 7.600f };
+        cfg.light.range = 22.300f;
+        cfg.light.color = { 0.870f, 0.890f, 1.330f };
+        cfg.light.intensity = 1.690f;
+        cfg.light.ambient_intensity = 0.530f;
 
-AnimatedSvg create_animated_svg(recompui::ContextId context, recompui::Element *parent, const std::string &svg_path, float width, float height) {
-    AnimatedSvg animated_svg;
-    animated_svg.width = width;
-    animated_svg.height = height;
-    animated_svg.svg = context.create_element<recompui::Svg>(parent, svg_path);
-    animated_svg.svg->set_position(recompui::Position::Absolute);
-    animated_svg.svg->set_width(width, recompui::Unit::Dp);
-    animated_svg.svg->set_height(height, recompui::Unit::Dp);
-    return animated_svg;
-}
-
-void update_animated_svg(AnimatedSvg &animated_svg, float delta_time, float bg_width, float bg_height) {
-    float position_x = 0.0f, position_y = 0.0f;
-    float scale_x = 1.0f, scale_y = 1.0f;
-    float rotation_degrees = 0.0f;
-    calculate_2d_from_keyframes(animated_svg.position_keyframes, animated_svg.position_animation, delta_time, position_x, position_y);
-    calculate_2d_from_keyframes(animated_svg.scale_keyframes, animated_svg.scale_animation, delta_time, scale_x, scale_y);
-    calculate_rot_from_keyframes(animated_svg.rotation_keyframes, animated_svg.rotation_animation, delta_time, rotation_degrees);
-    animated_svg.svg->set_translate_2D(position_x + bg_width / 2.0f - animated_svg.width / 2.0f, position_y + bg_height / 2.0f - animated_svg.height / 2.0f);
-    animated_svg.svg->set_scale_2D(scale_x, scale_y);
-    animated_svg.svg->set_rotation(rotation_degrees);
-}
-
-bool check_skip_input(SDL_Event* event) {
-    switch (event->type) {
-    case SDL_KEYDOWN:
-        return event->key.keysym.scancode == SDL_SCANCODE_ESCAPE ||
-            event->key.keysym.scancode == SDL_SCANCODE_SPACE ||
-            (event->key.keysym.scancode == SDL_SCANCODE_RETURN && (event->key.keysym.mod & (KMOD_LALT | KMOD_RALT)) == KMOD_NONE);
-    case SDL_CONTROLLERBUTTONDOWN:
-    case SDL_MOUSEBUTTONDOWN:
-        return true;
-    default:
-        return false;
-    }
-}
-
-int launcher_event_watch(void* userdata, SDL_Event* event) {
-    (void)userdata;
-    if (!launcher_context.animation_skipped.load() && check_skip_input(event)) {
-        launcher_context.animation_skipped.store(true);
-        launcher_context.skip_animation_next_update.store(true);
-        return 0;
-    }
-    else {
-        return 1;
-    }
-}
-
-const float jiggy_scale_anim_start = 0.0f;
-const float jiggy_scale_anim_length = 0.75f;
-const float jiggy_scale_anim_end = jiggy_scale_anim_start + jiggy_scale_anim_length;
-const float jiggy_move_over_start = jiggy_scale_anim_end + 0.5f;
-const float jiggy_move_over_length = 0.75f;
-const float jiggy_move_over_end = jiggy_move_over_start + jiggy_move_over_length;
-const float jiggy_shine_start = jiggy_move_over_end + 0.6f;
-const float jiggy_shine_length = 0.8f;
-
-const float animation_skip_time = 10.0f;
-
-static void starfield_respawn(StarfieldStar& star, float bg_width, float bg_height, bool initial) {
-    float cx = bg_width * 0.5f;
-    if (initial) {
-        star.x = (float)(std::rand() % (int)(bg_width + 1)) - cx;
-    } else {
-        star.x = cx + (float)(std::rand() % (int)(bg_width * 0.4f + 1));
-    }
-    star.y = (float)(std::rand() % (int)(bg_height + 1)) - bg_height * 0.5f;
-    star.depth = (float)(std::rand() % 1000) / 1000.0f;
-    star.speed_dp = STARFIELD_BASE_SPEED_DP + star.depth * STARFIELD_SPEED_RANGE_DP;
-    star.size_dp = STARFIELD_SIZE_MIN_DP + star.depth * (STARFIELD_SIZE_MAX_DP - STARFIELD_SIZE_MIN_DP);
-}
-
-static void starfield_create_layer(recompui::ContextId context, recompui::Element* background_container, float bg_width, float bg_height) {
-    launcher_context.starfield_wrapper = context.create_element<recompui::Element>(background_container, 0);
-    launcher_context.starfield_wrapper->set_position(recompui::Position::Absolute);
-    launcher_context.starfield_wrapper->set_width(100, recompui::Unit::Percent);
-    launcher_context.starfield_wrapper->set_height(100, recompui::Unit::Percent);
-    launcher_context.starfield_wrapper->set_left(0);
-    launcher_context.starfield_wrapper->set_top(0);
-
-    launcher_context.starfield_stars.resize(STARFIELD_NUM_STARS);
-    for (int i = 0; i < STARFIELD_NUM_STARS; i++) {
-        StarfieldStar& star = launcher_context.starfield_stars[i];
-        starfield_respawn(star, bg_width, bg_height, true);
-        for (int t = 0; t < STARFIELD_TRAIL_DOTS; t++) {
-            recompui::Element* dot = context.create_element<recompui::Element>(launcher_context.starfield_wrapper, 0);
-            dot->set_position(recompui::Position::Absolute);
-            float trail_scale = starfield_trail_dot_scale(t);
-            float size = star.size_dp * trail_scale;
-            if (size < STARFIELD_DOT_SIZE_MIN_DP) size = STARFIELD_DOT_SIZE_MIN_DP;
-            dot->set_width(size, recompui::Unit::Dp);
-            dot->set_height(size, recompui::Unit::Dp);
-            dot->set_border_radius(size * 0.5f, recompui::Unit::Dp);
-            dot->set_background_color(recompui::Color{ 255, 255, 255, (uint8_t)(255 * starfield_trail_opacity(t)) });
-            star.dots[t] = dot;
-        }
-    }
-}
-
-// Trail spacing scales with depth: far stars (depth 0) get shorter trails, near stars (depth 1) get full length.
-static float starfield_trail_spacing_for_star(const StarfieldStar& star) {
-    return STARFIELD_TRAIL_SPACING_DP * (STARFIELD_TRAIL_LENGTH_FAR + star.depth * (1.0f - STARFIELD_TRAIL_LENGTH_FAR));
-}
-
-static void starfield_update(float delta_time, float bg_width, float bg_height) {
-    if (!launcher_context.starfield_wrapper || launcher_context.starfield_stars.empty()) return;
-    float cx = bg_width * 0.5f;
-    float cy = bg_height * 0.5f;
-
-    for (StarfieldStar& star : launcher_context.starfield_stars) {
-        star.x -= star.speed_dp * delta_time;
-        float spacing = starfield_trail_spacing_for_star(star);
-        float trail_length_dp = spacing * (float)(STARFIELD_TRAIL_DOTS - 1);
-        float left_edge = -cx - trail_length_dp - 20.0f;
-        if (star.x < left_edge) {
-            starfield_respawn(star, bg_width, bg_height, false);
-            spacing = starfield_trail_spacing_for_star(star);
-        }
-        for (int t = 0; t < STARFIELD_TRAIL_DOTS; t++) {
-            float dx = star.x + (float)t * spacing;
-            float trail_scale = starfield_trail_dot_scale(t);
-            float dot_size = star.size_dp * trail_scale;
-            if (dot_size < STARFIELD_DOT_SIZE_MIN_DP) dot_size = STARFIELD_DOT_SIZE_MIN_DP;
-            float dot_x = cx + dx - dot_size * 0.5f;
-            float dot_y = cy + star.y - dot_size * 0.5f;
-            star.dots[t]->set_width(dot_size, recompui::Unit::Dp);
-            star.dots[t]->set_height(dot_size, recompui::Unit::Dp);
-            star.dots[t]->set_border_radius(dot_size * 0.5f, recompui::Unit::Dp);
-            star.dots[t]->set_translate_2D(dot_x, dot_y, recompui::Unit::Dp);
-        }
-    }
-}
-
-void sssv::launcher_animation_setup(recompui::LauncherMenu *menu) {
-    auto context = recompui::get_current_context();
-    recompui::Element* background_container = menu->get_background_container();
-    background_container->set_background_color({ 0, 0, 0, 255 });
-
-    std::srand((unsigned)std::time(nullptr));
-    float initial_bg_width = 1920.0f;
-    float initial_bg_height = 1080.0f;
-    starfield_create_layer(context, background_container, initial_bg_width, initial_bg_height);
-
-    launcher_context.wrapper = context.create_element<recompui::Element>(background_container, 0);
-    launcher_context.wrapper->set_position(recompui::Position::Absolute);
-    launcher_context.wrapper->set_width(100, recompui::Unit::Percent);
-    launcher_context.wrapper->set_height(100, recompui::Unit::Percent);
-    launcher_context.wrapper->set_top(0);
-
-    // Disable and hide the options.
-    for (auto option : menu->get_game_options_menu()->get_options()) {
-        option->set_font_family(recompui::get_primary_font_family());
-        option->set_font_weight(400);
-        option->set_enabled(false);
-        option->set_opacity(0.0f);
-        option->set_padding(24.0f);
-        auto label = option->get_label();
-        label->set_font_size(56.0f);
-        label->set_font_weight(400);
-        label->set_letter_spacing(4.0f);
-    }
-
-    // The creation order of these is important.
-    // --- Jiggy, Banjo, Kazooie, Clouds: auskommentiert, nur Logo + Starfield aktiv ---
-    // launcher_context.jiggy_color_svg = create_animated_svg(context, launcher_context.wrapper, "JiggyColor.svg", 1054.0f, 1044.0f);
-    // launcher_context.jiggy_shine_svg = create_animated_svg(context, launcher_context.wrapper, "JiggyShine.svg", 219.0f, 1080.0f);
-    // launcher_context.jiggy_hole_svg = create_animated_svg(context, launcher_context.wrapper, "JiggyHole.svg", 2180.0f, 2160.0f);
-    // launcher_context.banjo_svg = create_animated_svg(context, launcher_context.wrapper, "Banjo.svg", 649.0f, 622.0f);
-    // launcher_context.kazooie_svg = create_animated_svg(context, launcher_context.wrapper, "Kazooie.svg", 626.0f, 774.0f);
-    // launcher_context.cloud_svgs[0] = create_animated_svg(context, background_container, "Cloud1.svg", 461.0f, 154.0f);
-    // launcher_context.cloud_svgs[1] = create_animated_svg(context, background_container, "Cloud2.svg", 461.0f, 167.0f);
-    // launcher_context.cloud_svgs[2] = create_animated_svg(context, background_container, "Cloud3.svg", 295.0f, 167.0f);
-    // launcher_context.cloud_svgs[3] = create_animated_svg(context, background_container, "Cloud1.svg", 461.0f, 154.0f);
-
-    launcher_context.logo_svg = create_animated_svg(context, background_container, "Logo.svg", 6187.0f * 0.125f, 2625.0f * 0.125f);
-
-    // --- Jiggy/Banjo/Kazooie keyframes: auskommentiert ---
-    // launcher_context.jiggy_hole_svg.position_keyframes = { ... };
-    // launcher_context.jiggy_hole_svg.scale_keyframes = { ... };
-    // launcher_context.jiggy_hole_svg.rotation_keyframes = { ... };
-    // launcher_context.jiggy_color_svg.* = ... (copy from hole)
-    // launcher_context.jiggy_shine_svg.position_keyframes = { ... };
-    // launcher_context.banjo_svg.position_keyframes = { ... };
-    // launcher_context.banjo_svg.scale_keyframes = { ... };
-    // launcher_context.banjo_svg.rotation_keyframes = { ... };
-    // launcher_context.kazooie_svg.* = ... (mirror banjo)
-
-    // Animate the logo.
-    launcher_context.logo_svg.position_keyframes = {
-        { 0.0f, 0.0f, -900.0f },
-        { 1.0f, 0.0f, -900.0f },
-        { 2.0f, 0.0f, -365.0f },
+        cfg.intro.duration_sec = 1.780f;
+        cfg.intro.overshoot = 0.290f;
+        cfg.intro.damping = 7.250f;
+        cfg.intro.play_once = true;
+        cfg.visible_only_on_title_screen = true;
+        return cfg;
     };
 
-    launcher_context.logo_svg.position_animation.interpolation_method = InterpolationMethod::Smootherstep;
+    const csdk::launcher3d::Config cfg = make_title_intro_model_config();
 
-    // --- Wolken-Keyframes: auskommentiert ---
-    // launcher_context.cloud_svgs[0..3].position_keyframes / scale_keyframes / loop_keyframe_index
+    std::fprintf(stdout,
+        "[CellenseresSDK] launcher_animation: configure_title_intro_model path='%s'\n",
+        cfg.glb_path.string().c_str());
+    std::fflush(stdout);
 
-    // Install an event watch to skip the launcher animation if a keyboard, mouse or controller input is detected.
-    SDL_AddEventWatch(&launcher_event_watch, nullptr);
+    title_model_active = csdk::launcher3d::configure(cfg);
+    std::fprintf(stdout,
+        "[CellenseresSDK] launcher_animation: configure_title_intro_model result=%s\n",
+        title_model_active ? "success" : "failed");
+    std::fflush(stdout);
+    return title_model_active;
 }
 
-void sssv::launcher_animation_update(recompui::LauncherMenu *menu) {
-    std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-    float delta_time = launcher_context.started ? std::chrono::duration_cast<std::chrono::milliseconds>(now - launcher_context.last_update_time).count() / 1000.0f : 0.0f;
-    if (launcher_context.skip_animation_next_update.exchange(false)) {
-        delta_time = std::max(animation_skip_time - launcher_context.seconds, 0.0f);
-    }
+float lerp(float a, float b, float t) {
+    return a + (b - a) * t;
+}
 
-    launcher_context.seconds += delta_time;
-    launcher_context.last_update_time = now;
-    launcher_context.started = true;
+float smootherstep(float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
 
-    recompui::Element* background_container = menu->get_background_container();
-    float dp_to_pixel_ratio = background_container->get_dp_to_pixel_ratio();
-    float bg_width = background_container->get_client_width() / dp_to_pixel_ratio;
-    float bg_height = background_container->get_client_height() / dp_to_pixel_ratio;
+float intro_sine_256(float degrees) {
+    constexpr float radians_per_degree = 3.14159265358979323846f / 180.0f;
+    return std::round(std::sin(degrees * radians_per_degree) * 256.0f);
+}
 
-    starfield_update(delta_time, bg_width, bg_height);
+void update_title_background_layout(float bg_width_dp, float bg_height_dp) {
+    const float cover_scale = std::max(
+        bg_width_dp / kTitleBackgroundAssetWidthDp,
+        bg_height_dp / kTitleBackgroundAssetHeightDp
+    );
 
-    // Banjo, Kazooie, Jiggy, Wolken: auskommentiert
-    // update_animated_svg(launcher_context.banjo_svg, ...);
-    // update_animated_svg(launcher_context.kazooie_svg, ...);
-    // update_animated_svg(launcher_context.jiggy_color_svg, ...);
-    // update_animated_svg(launcher_context.jiggy_shine_svg, ...);
-    // update_animated_svg(launcher_context.jiggy_hole_svg, ...);
-    update_animated_svg(launcher_context.logo_svg, delta_time, bg_width, bg_height);
-    // for (size_t i = 0; i < launcher_context.cloud_svgs.size(); i++) { update_animated_svg(launcher_context.cloud_svgs[i], ...); }
+    title_background_state.cover_width_dp = kTitleBackgroundAssetWidthDp * cover_scale;
+    title_background_state.cover_height_dp = kTitleBackgroundAssetHeightDp * cover_scale;
+    // Match the original feel: the background settles with its left edge pinned to the viewport.
+    // We still use cover scaling so the viewport is always fully filled without distorting the image.
+    title_background_state.base_x_dp = 0.0f;
+    title_background_state.base_y_dp = (bg_height_dp - title_background_state.cover_height_dp) * 0.5f;
+    title_background_state.last_bg_width_dp = bg_width_dp;
+    title_background_state.last_bg_height_dp = bg_height_dp;
+}
 
-    float wrapper_phase = std::clamp((launcher_context.seconds - jiggy_move_over_start) / (jiggy_move_over_end - jiggy_move_over_start), 0.0f, 1.0f);
-    if (wrapper_phase != launcher_context.wrapper_phase) {
-        float x_translation = interpolate_value(0, 1440 * -0.2f, wrapper_phase, InterpolationMethod::Smootherstep);
-        launcher_context.wrapper->set_translate_2D(x_translation, 0, recompui::Unit::Dp);
-        float y_translation = interpolate_value(0, sssv::launcher_options_top_offset, wrapper_phase, InterpolationMethod::Smootherstep);
-        launcher_context.wrapper->set_top(y_translation);
-        float scale = interpolate_value(1, 0.666f, wrapper_phase, InterpolationMethod::Smootherstep);
-        launcher_context.wrapper->set_scale_2D(scale, scale);
+void reset_title_background_animation(float bg_width_dp, float bg_height_dp) {
+    update_title_background_layout(bg_width_dp, bg_height_dp);
 
-        float game_option_menu_opacity = interpolate_value(0, 1.0f, wrapper_phase, InterpolationMethod::Smootherstep);
-        for (auto option : menu->get_game_options_menu()->get_options()) {
-            option->set_opacity(game_option_menu_opacity);
+    title_background_state.phase = TitleAnimationPhase::SlidingIn;
+    title_background_state.started = false;
+    title_background_state.accumulator_seconds = 0.0f;
+    title_background_state.last_update_time = std::chrono::steady_clock::time_point{};
+    title_background_state.bounce_phase_degrees = 180.0f;
+    title_background_state.bounce_divisor = 0;
+
+    // Start fully offscreen on the right, then reproduce the original 16-frame slide-in.
+    title_background_state.x_offset_dp = bg_width_dp - title_background_state.base_x_dp;
+    title_background_state.slide_step_dp = title_background_state.x_offset_dp / static_cast<float>(kTitleSlideInSteps);
+}
+
+void simulate_title_background_step(float bg_width_dp) {
+    switch (title_background_state.phase) {
+    case TitleAnimationPhase::SlidingIn:
+        if (title_background_state.x_offset_dp <= 0.0f) {
+            title_background_state.phase = TitleAnimationPhase::Bouncing;
+        } else {
+            title_background_state.x_offset_dp = std::max(0.0f, title_background_state.x_offset_dp - title_background_state.slide_step_dp);
+        }
+        break;
+    case TitleAnimationPhase::Bouncing:
+        if (title_background_state.bounce_phase_degrees >= 359.0f) {
+            title_background_state.bounce_phase_degrees = 0.0f;
         }
 
-        float game_option_menu_right = interpolate_value(sssv::launcher_options_right_position_start, sssv::launcher_options_right_position_end, wrapper_phase, InterpolationMethod::Smootherstep);
-        menu->get_game_options_menu()->set_right(game_option_menu_right);
-
-        launcher_context.wrapper_phase = wrapper_phase;
-    }
-
-    if (!launcher_context.options_enabled && launcher_context.seconds >= jiggy_move_over_end) {
-        SDL_DelEventWatch(&launcher_event_watch, nullptr);
-
-        for (auto option : menu->get_game_options_menu()->get_options()) {
-            option->set_enabled(true);
-            option->set_opacity(1.0f);
+        if ((static_cast<int>(title_background_state.bounce_phase_degrees) % 180) == 0) {
+            title_background_state.bounce_divisor += 4;
         }
 
-        launcher_context.options_enabled = true;
+        if (title_background_state.bounce_divisor > 0) {
+            title_background_state.x_offset_dp =
+                std::abs(intro_sine_256(title_background_state.bounce_phase_degrees) / static_cast<float>(title_background_state.bounce_divisor))
+                * (bg_width_dp / 320.0f);
+        } else {
+            title_background_state.x_offset_dp = 0.0f;
+        }
+
+        if (title_background_state.bounce_divisor < 5) {
+            title_background_state.bounce_phase_degrees += kTitleBouncePhaseStepDegrees;
+        } else {
+            title_background_state.phase = TitleAnimationPhase::Complete;
+            title_background_state.x_offset_dp = 0.0f;
+        }
+        break;
+    case TitleAnimationPhase::Complete:
+    case TitleAnimationPhase::Uninitialized:
+    default:
+        title_background_state.x_offset_dp = 0.0f;
+        break;
+    }
+}
+
+void update_title_background_visual() {
+    if (title_background_state.image == nullptr) {
+        return;
+    }
+
+    title_background_state.image->set_width(title_background_state.cover_width_dp, recompui::Unit::Dp);
+    title_background_state.image->set_height(title_background_state.cover_height_dp, recompui::Unit::Dp);
+    title_background_state.image->set_translate_2D(
+        title_background_state.base_x_dp + title_background_state.x_offset_dp,
+        title_background_state.base_y_dp,
+        recompui::Unit::Dp
+    );
+}
+
+float trail_dot_scale(size_t index) {
+    if (kTrailDots <= 1) {
+        return 1.0f;
+    }
+
+    return 1.0f - (1.0f - kTrailScaleMin) * static_cast<float>(index) / static_cast<float>(kTrailDots - 1);
+}
+
+float trail_dot_opacity(size_t index) {
+    if (kTrailDots <= 1) {
+        return kTrailOpacityMax;
+    }
+
+    return kTrailOpacityMax + (kTrailOpacityMin - kTrailOpacityMax) * static_cast<float>(index) / static_cast<float>(kTrailDots - 1);
+}
+
+struct Star {
+    float x = 0.0f;
+    float y = 0.0f;
+    float depth = 0.0f;
+    float speed_dp = 0.0f;
+    float size_dp = 0.0f;
+    std::array<recompui::Element*, kTrailDots> dots{};
+};
+
+class PreGameConfigBackground final : public recompui::Element {
+public:
+    PreGameConfigBackground(recompui::ResourceId rid, recompui::Element* parent)
+        : Element(rid, parent, recompui::Events(recompui::EventType::Update)),
+          rng_(kAnimationSeed) {
+        set_position(recompui::Position::Absolute);
+        set_top(0);
+        set_right(0);
+        set_bottom(0);
+        set_left(0);
+        set_pointer_events(recompui::PointerEvents::None);
+        set_overflow(recompui::Overflow::Hidden);
+        set_border_radius(recompui::theme::border::radius_lg);
+        set_background_color({ 0, 0, 0, 255 });
+
+        auto context = recompui::get_current_context();
+        stars_.resize(kStarCount);
+        for (Star& star : stars_) {
+            for (size_t dot_index = 0; dot_index < kTrailDots; ++dot_index) {
+                auto* dot = context.create_element<recompui::Element>(this, 0);
+                dot->set_position(recompui::Position::Absolute);
+                dot->set_background_color({ 255, 255, 255, static_cast<uint8_t>(255.0f * trail_dot_opacity(dot_index)) });
+                star.dots[dot_index] = dot;
+            }
+        }
+
+        logo_ = context.create_element<recompui::Svg>(this, "Logo.svg");
+        logo_->set_position(recompui::Position::Absolute);
+        logo_->set_width(kLogoWidthDp, recompui::Unit::Dp);
+        logo_->set_height(kLogoHeightDp, recompui::Unit::Dp);
+
+        queue_update();
+    }
+
+private:
+    std::vector<Star> stars_;
+    recompui::Svg* logo_ = nullptr;
+    DeterministicRng rng_;
+    std::chrono::steady_clock::time_point last_update_time_{};
+    float accumulator_seconds_ = 0.0f;
+    float elapsed_seconds_ = 0.0f;
+    bool started_ = false;
+    bool visible_ = false;
+
+    std::string_view get_type_name() override {
+        return "PreGameConfigBackground";
+    }
+
+    void process_event(const recompui::Event& e) override {
+        if (e.type != recompui::EventType::Update) {
+            return;
+        }
+
+        queue_update();
+
+        const bool should_show = !ultramodern::is_game_started();
+        if (!should_show) {
+            display_hide();
+            visible_ = false;
+            started_ = false;
+            accumulator_seconds_ = 0.0f;
+            return;
+        }
+
+        display_show();
+
+        const float dp_ratio = get_dp_to_pixel_ratio();
+        if (dp_ratio <= 0.0f) {
+            return;
+        }
+
+        const float bg_width = get_client_width() / dp_ratio;
+        const float bg_height = get_client_height() / dp_ratio;
+        if (bg_width <= 1.0f || bg_height <= 1.0f) {
+            return;
+        }
+
+        if (!visible_) {
+            reset_animation(bg_width, bg_height);
+            visible_ = true;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        float delta_seconds = 0.0f;
+        if (started_) {
+            delta_seconds = std::chrono::duration_cast<std::chrono::duration<float>>(now - last_update_time_).count();
+            delta_seconds = std::clamp(delta_seconds, 0.0f, kMaxFrameDeltaSeconds);
+        }
+        last_update_time_ = now;
+        started_ = true;
+
+        accumulator_seconds_ += delta_seconds;
+        while (accumulator_seconds_ >= kFixedStepSeconds) {
+            advance_simulation(kFixedStepSeconds, bg_width, bg_height);
+            accumulator_seconds_ -= kFixedStepSeconds;
+        }
+
+        update_visuals(bg_width, bg_height);
+    }
+
+    void reset_animation(float bg_width, float bg_height) {
+        rng_.reset(kAnimationSeed);
+        elapsed_seconds_ = 0.0f;
+        accumulator_seconds_ = 0.0f;
+        last_update_time_ = std::chrono::steady_clock::time_point{};
+        started_ = false;
+
+        for (Star& star : stars_) {
+            spawn_star(star, bg_width, bg_height, true);
+        }
+
+        update_visuals(bg_width, bg_height);
+    }
+
+    void spawn_star(Star& star, float bg_width, float bg_height, bool initial_spawn) {
+        const float half_width = bg_width * 0.5f;
+        const float half_height = bg_height * 0.5f;
+
+        star.x = initial_spawn
+            ? rng_.next_range(-half_width, half_width)
+            : rng_.next_range(half_width, half_width + bg_width * 0.35f);
+        star.y = rng_.next_range(-half_height, half_height);
+        star.depth = rng_.next_unit_float();
+        star.speed_dp = kBaseSpeedDp + star.depth * kSpeedRangeDp;
+        star.size_dp = kSizeMinDp + star.depth * (kSizeMaxDp - kSizeMinDp);
+    }
+
+    float trail_spacing_for_star(const Star& star) const {
+        return kTrailSpacingDp * (kTrailLengthFar + star.depth * (1.0f - kTrailLengthFar));
+    }
+
+    void advance_simulation(float delta_seconds, float bg_width, float bg_height) {
+        elapsed_seconds_ += delta_seconds;
+
+        const float half_width = bg_width * 0.5f;
+        for (Star& star : stars_) {
+            star.x -= star.speed_dp * delta_seconds;
+
+            const float spacing = trail_spacing_for_star(star);
+            const float trail_length = spacing * static_cast<float>(kTrailDots - 1);
+            const float offscreen_left = -half_width - trail_length - 20.0f;
+            if (star.x < offscreen_left) {
+                spawn_star(star, bg_width, bg_height, false);
+            }
+        }
+    }
+
+    void update_visuals(float bg_width, float bg_height) {
+        const float center_x = bg_width * 0.5f;
+        const float center_y = bg_height * 0.5f;
+
+        for (Star& star : stars_) {
+            const float spacing = trail_spacing_for_star(star);
+            for (size_t dot_index = 0; dot_index < kTrailDots; ++dot_index) {
+                const float scale = trail_dot_scale(dot_index);
+                float dot_size = star.size_dp * scale;
+                dot_size = std::max(dot_size, kDotSizeMinDp);
+
+                auto* dot = star.dots[dot_index];
+                dot->set_width(dot_size, recompui::Unit::Dp);
+                dot->set_height(dot_size, recompui::Unit::Dp);
+                dot->set_border_radius(dot_size * 0.5f, recompui::Unit::Dp);
+
+                const float dot_x = center_x + star.x + static_cast<float>(dot_index) * spacing - dot_size * 0.5f;
+                const float dot_y = center_y + star.y - dot_size * 0.5f;
+                dot->set_translate_2D(dot_x, dot_y, recompui::Unit::Dp);
+            }
+        }
+
+        const float intro_t = std::clamp(elapsed_seconds_ / kLogoIntroDurationSeconds, 0.0f, 1.0f);
+        const float intro_phase = smootherstep(intro_t);
+        float logo_y = lerp(kLogoStartYDp, kLogoEndYDp, intro_phase);
+        if (intro_t >= 1.0f) {
+            const float drift_phase = (elapsed_seconds_ - kLogoIntroDurationSeconds) * 2.0f * 3.14159265f * kLogoDriftFrequencyHz;
+            logo_y += std::sin(drift_phase) * kLogoDriftAmplitudeDp;
+        }
+
+        logo_->set_opacity(lerp(0.0f, 1.0f, intro_phase));
+        logo_->set_translate_2D(
+            center_x - kLogoWidthDp * 0.5f,
+            center_y - kLogoHeightDp * 0.5f + logo_y,
+            recompui::Unit::Dp
+        );
+    }
+};
+} // namespace
+
+void sssv::launcher_animation_setup(recompui::LauncherMenu* menu) {
+    auto* background_container = menu->get_background_container();
+    background_container->set_background_color({ 0, 0, 0, 255 });
+    background_container->set_overflow(recompui::Overflow::Hidden);
+
+    title_model_active = configure_title_intro_model();
+    title_model_intro_gate_open = false;
+    if (title_model_active) {
+        // Delay 3D intro until the title background has finished its slide+bounce animation.
+        csdk::launcher3d::set_enabled(false);
+    }
+
+    csdk::ui::queue_image_from_file(
+        "img_space_background.png",
+        recompui::file::get_asset_path("img_space_background.png")
+    );
+
+    auto context = recompui::get_current_context();
+    title_background_state.image = context.create_element<recompui::Image>(background_container, "img_space_background.png");
+    title_background_state.image->set_position(recompui::Position::Absolute);
+    title_background_state.image->set_top(0);
+    title_background_state.image->set_left(0);
+
+    title_background_state.phase = TitleAnimationPhase::Uninitialized;
+    title_background_state.started = false;
+    title_background_state.accumulator_seconds = 0.0f;
+    title_background_state.last_bg_width_dp = 0.0f;
+    title_background_state.last_bg_height_dp = 0.0f;
+}
+
+void sssv::launcher_animation_update(recompui::LauncherMenu* menu) {
+    Launcher3DMenuUpdateScope launcher3d_scope(menu);
+
+    if (!config_background_initialized) {
+        setup_config_menu_background_animation();
+    }
+
+    auto* background_container = menu->get_background_container();
+    if (background_container == nullptr || title_background_state.image == nullptr) {
+        return;
+    }
+
+    const float dp_ratio = background_container->get_dp_to_pixel_ratio();
+    if (dp_ratio <= 0.0f) {
+        return;
+    }
+
+    const float bg_width_dp = background_container->get_client_width() / dp_ratio;
+    const float bg_height_dp = background_container->get_client_height() / dp_ratio;
+    if (bg_width_dp <= 1.0f || bg_height_dp <= 1.0f) {
+        return;
+    }
+
+    const bool needs_layout_refresh =
+        title_background_state.phase == TitleAnimationPhase::Uninitialized ||
+        title_background_state.last_bg_width_dp != bg_width_dp ||
+        title_background_state.last_bg_height_dp != bg_height_dp;
+
+    if (needs_layout_refresh) {
+        if (title_background_state.phase == TitleAnimationPhase::Uninitialized) {
+            reset_title_background_animation(bg_width_dp, bg_height_dp);
+        } else {
+            update_title_background_layout(bg_width_dp, bg_height_dp);
+        }
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    float delta_seconds = 0.0f;
+    if (title_background_state.started) {
+        delta_seconds = std::chrono::duration_cast<std::chrono::duration<float>>(now - title_background_state.last_update_time).count();
+        delta_seconds = std::clamp(delta_seconds, 0.0f, kMaxFrameDeltaSeconds);
+    }
+
+    title_background_state.last_update_time = now;
+    title_background_state.started = true;
+
+    title_background_state.accumulator_seconds += delta_seconds;
+    while (title_background_state.accumulator_seconds >= kFixedStepSeconds) {
+        simulate_title_background_step(bg_width_dp);
+        title_background_state.accumulator_seconds -= kFixedStepSeconds;
+    }
+
+    update_title_background_visual();
+    apply_title_model_intro_gate(is_title_background_intro_complete());
+}
+
+void sssv::setup_config_menu_background_animation() {
+    if (config_background_initialized) {
+        return;
+    }
+
+    auto* modal = recompui::config::get_config_modal();
+    if (modal == nullptr) {
+        return;
+    }
+
+    auto* modal_element = modal->get_body()->get_parent();
+    if (modal_element == nullptr) {
+        return;
+    }
+
+    recompui::ContextId previous_context = recompui::try_close_current_context();
+    auto context = modal->modal_root_context;
+    bool opened = context.open_if_not_already();
+    auto* background = context.create_element<PreGameConfigBackground>(modal_element);
+    csdk::ui::prepend_child(modal_element, background);
+    config_background_initialized = true;
+    if (opened) {
+        context.close();
+    }
+    if (previous_context != recompui::ContextId::null()) {
+        previous_context.open();
     }
 }

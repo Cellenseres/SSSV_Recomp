@@ -6,6 +6,7 @@
 namespace sssv {
     void launcher_animation_setup(recompui::LauncherMenu* menu);
     void launcher_animation_update(recompui::LauncherMenu* menu);
+    void setup_config_menu_background_animation();
 
     constexpr float launcher_options_right_position_start = 48.0f;
     constexpr float launcher_options_right_position_end = 24.0f + 24.0f;

@@ -47,7 +47,9 @@
 #include "librecomp/game.hpp"
 #include "librecomp/mods.hpp"
 #include "librecomp/helpers.hpp"
+#include "cs_sdk/launcher_model3d.h"
 #include "cs_sdk/launcher_music.h"
+#include "rt64_render_hooks.h"
 
 #ifdef _WIN32
 #include <unknwn.h>
@@ -940,8 +942,48 @@ int main(int argc, char** argv) {
 
     ultramodern::renderer::callbacks_t renderer_callbacks{
         .create_render_context = [](uint8_t* rdram, ultramodern::renderer::WindowHandle window_handle, bool developer_mode) -> std::unique_ptr<ultramodern::renderer::RendererContext> {
+            RT64::RenderHookInit* before_init = RT64::GetRenderHookInit();
+            RT64::RenderHookDraw* before_draw = RT64::GetRenderHookDraw();
+            RT64::RenderHookDeinit* before_deinit = RT64::GetRenderHookDeinit();
+            fprintf(stdout,
+                "[CellenseresSDK] main: create_render_context begin dev_mode=%s hooks_before(init/draw/deinit)=%s/%s/%s\n",
+                developer_mode ? "yes" : "no",
+                before_init ? "set" : "null",
+                before_draw ? "set" : "null",
+                before_deinit ? "set" : "null");
+            fflush(stdout);
+
             auto presentation_mode = ultramodern::renderer::PresentationMode::PresentEarly;
             auto inner_context = recompui::renderer::create_render_context(rdram, window_handle, presentation_mode, developer_mode);
+
+            auto* rt64_context = dynamic_cast<recompui::renderer::RT64Context*>(inner_context.get());
+            fprintf(stdout,
+                "[CellenseresSDK] main: create_render_context ready cast_rt64=%s app=%s rhi=%s device=%s\n",
+                rt64_context ? "yes" : "no",
+                (rt64_context && rt64_context->app) ? "set" : "null",
+                (rt64_context && rt64_context->app && rt64_context->app->renderInterface) ? "set" : "null",
+                (rt64_context && rt64_context->app && rt64_context->app->device) ? "set" : "null");
+            fflush(stdout);
+
+            csdk::launcher3d::install_render_hook_chain();
+            csdk::launcher3d::prime_render_backend(
+                (rt64_context && rt64_context->app && rt64_context->app->renderInterface) ? rt64_context->app->renderInterface.get() : nullptr,
+                (rt64_context && rt64_context->app && rt64_context->app->device) ? rt64_context->app->device.get() : nullptr
+            );
+
+            RT64::RenderHookInit* after_init = RT64::GetRenderHookInit();
+            RT64::RenderHookDraw* after_draw = RT64::GetRenderHookDraw();
+            RT64::RenderHookDeinit* after_deinit = RT64::GetRenderHookDeinit();
+            fprintf(stdout,
+                "[CellenseresSDK] main: hooks_after_install init=%s draw=%s deinit=%s changed(init/draw/deinit)=%s/%s/%s\n",
+                after_init ? "set" : "null",
+                after_draw ? "set" : "null",
+                after_deinit ? "set" : "null",
+                (after_init != before_init) ? "yes" : "no",
+                (after_draw != before_draw) ? "yes" : "no",
+                (after_deinit != before_deinit) ? "yes" : "no");
+            fflush(stdout);
+
             return std::make_unique<RT64CompatContext>(std::move(inner_context), rdram);
         },
     };
