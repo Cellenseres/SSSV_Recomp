@@ -59,6 +59,7 @@
 #include "hle/rt64_application.h"
 #include "gbi/rt64_gbi_rdp.h"
 #include "gbi/rt64_gbi_f3dex.h"
+#include "gbi/rt64_gbi_s2d.h"
 #include "gbi/rt64_gbi_s2dex.h"
 
 #ifdef _WIN32
@@ -388,6 +389,7 @@ void shutdown_launcher_audio_device() {
 enum class UnknownGBIFallback {
     None,
     F3DEX,
+    S2D,
     S2DEX,
 };
 
@@ -395,6 +397,8 @@ const char* unknown_gbi_fallback_name(UnknownGBIFallback fallback) {
     switch (fallback) {
     case UnknownGBIFallback::F3DEX:
         return "F3DEX";
+    case UnknownGBIFallback::S2D:
+        return "S2D";
     case UnknownGBIFallback::S2DEX:
         return "S2DEX";
     default:
@@ -462,7 +466,7 @@ UnknownGBIFallback get_unknown_gbi_fallback(uint8_t* rdram, const OSTask* task, 
     }
 
     if (ucode_name.find("S2D") != std::string::npos && ucode_name.find("S2DEX") == std::string::npos) {
-        return UnknownGBIFallback::S2DEX;
+        return UnknownGBIFallback::S2D;
     }
 
     if (ucode_name.find("S2DEX") != std::string::npos) {
@@ -486,6 +490,11 @@ void apply_unknown_gbi_fallback(RT64::Application* app, UnknownGBIFallback fallb
         RT64::GBI_RDP::setup(&unknown_gbi, true);
         RT64::GBI_F3DEX::setup(&unknown_gbi);
         break;
+    case UnknownGBIFallback::S2D:
+        unknown_gbi.ucode = RT64::GBIUCode::S2D;
+        RT64::GBI_RDP::setup(&unknown_gbi, true);
+        RT64::GBI_S2D::setup(&unknown_gbi);
+        break;
     case UnknownGBIFallback::S2DEX:
         unknown_gbi.ucode = RT64::GBIUCode::S2DEX;
         RT64::GBI_RDP::setup(&unknown_gbi, true);
@@ -500,7 +509,9 @@ void apply_unknown_gbi_fallback(RT64::Application* app, UnknownGBIFallback fallb
 class RT64CompatContext final : public ultramodern::renderer::RendererContext {
 public:
     RT64CompatContext(std::unique_ptr<ultramodern::renderer::RendererContext> inner_context, uint8_t* rdram)
-        : inner(std::move(inner_context)), rdram(rdram) {}
+        : inner(std::move(inner_context)), rdram(rdram), s2dSpriteUpscalingEnabled(sssv::get_2d_sprite_upscaling_enabled()) {
+        apply_sprite_upscaling_config();
+    }
 
     bool valid() override {
         return inner != nullptr && inner->valid();
@@ -515,7 +526,15 @@ public:
     }
 
     bool update_config(const ultramodern::renderer::GraphicsConfig& old_config, const ultramodern::renderer::GraphicsConfig& new_config) override {
-        return inner->update_config(old_config, new_config);
+        bool changed = inner->update_config(old_config, new_config);
+        const bool updatedSpriteUpscalingEnabled = sssv::get_2d_sprite_upscaling_enabled();
+        if (updatedSpriteUpscalingEnabled != s2dSpriteUpscalingEnabled) {
+            s2dSpriteUpscalingEnabled = updatedSpriteUpscalingEnabled;
+            apply_sprite_upscaling_config();
+            changed = true;
+        }
+
+        return changed;
     }
 
     void enable_instant_present() override {
@@ -551,6 +570,27 @@ private:
     std::unique_ptr<ultramodern::renderer::RendererContext> inner;
     uint8_t* rdram = nullptr;
     UnknownGBIFallback active_fallback = UnknownGBIFallback::None;
+    bool s2dSpriteUpscalingEnabled = true;
+
+    void apply_sprite_upscaling_config() {
+        auto* rt64_context = dynamic_cast<recompui::renderer::RT64Context*>(inner.get());
+        if ((rt64_context == nullptr) || (rt64_context->app == nullptr)) {
+            return;
+        }
+
+        RT64::UserConfiguration::SpriteUpscaling targetMode = s2dSpriteUpscalingEnabled
+            ? RT64::UserConfiguration::SpriteUpscaling::Upscaled
+            : RT64::UserConfiguration::SpriteUpscaling::Original;
+
+        if (rt64_context->app->userConfig.spriteUpscaling == targetMode) {
+            return;
+        }
+
+        rt64_context->app->userConfig.spriteUpscaling = targetMode;
+        if (rt64_context->app->sharedQueueResources != nullptr) {
+            rt64_context->app->updateUserConfig(false);
+        }
+    }
 
     void maybe_apply_unknown_ucode_fallback(const OSTask* task) {
         if (task == nullptr || task->t.type != M_GFXTASK) {

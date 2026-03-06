@@ -5,8 +5,23 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace sssv {
+
+namespace {
+    using EnumOptionVector = const std::vector<recomp::config::ConfigOptionEnumOption>;
+    enum class SpriteUpscalingOption {
+        Original,
+        Upscaled
+    };
+    constexpr const char* SpriteUpscaleOptionId = "sssv_2d_sprite_upscaling";
+
+    static EnumOptionVector sprite_upscaling_options = {
+        { SpriteUpscalingOption::Original, "Original" },
+        { SpriteUpscalingOption::Upscaled, "Upscaled" }
+    };
+}
 
 void init_config() {
     std::filesystem::path recomp_dir = recompui::file::get_app_folder_path();
@@ -21,12 +36,44 @@ void init_config() {
     general_options.has_mouse_sensitivity = false;
 
     recompui::config::create_general_tab(general_options);
-    recompui::config::create_graphics_tab();
+    recomp::config::Config& graphics_config = recompui::config::create_graphics_tab();
+    graphics_config.add_enum_option(
+        SpriteUpscaleOptionId,
+        "2D Sprite Upscaling",
+        "Controls whether legacy Sprite2D elements such as title art, menu sprites and similar 2D images use RT64's higher resolution sprite upscale path."
+        "<br />"
+        "<br />"
+        "<recomp-color primary>Original</recomp-color> keeps those sprites on the original low-resolution texel grid."
+        "<br />"
+        "<recomp-color primary>Upscaled</recomp-color> renders them through the shared high-resolution sprite path."
+        "<br />"
+        "<br />"
+        "This only has a visible effect when rendering above the original sprite resolution.",
+        sprite_upscaling_options,
+        SpriteUpscalingOption::Upscaled
+    );
     recompui::config::create_controls_tab();
     recompui::config::create_sound_tab();
     recompui::config::create_mods_tab();
     recompui::config::finalize();
 }
+
+bool get_2d_sprite_upscaling_enabled() {
+    try {
+        recomp::config::Config& graphics_config = recompui::config::get_graphics_config();
+        if (!graphics_config.has_option(SpriteUpscaleOptionId)) {
+            return true;
+        }
+
+        const auto option_value = graphics_config.get_option_value(SpriteUpscaleOptionId);
+        const auto sprite_upscaling = static_cast<SpriteUpscalingOption>(std::get<uint32_t>(option_value));
+        return sprite_upscaling == SpriteUpscalingOption::Upscaled;
+    }
+    catch (const std::exception&) {
+        return true;
+    }
+}
+
 void on_init(uint8_t* rdram, recomp_context* ctx) {
     (void)rdram;
     (void)ctx;
