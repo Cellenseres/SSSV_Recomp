@@ -22,8 +22,8 @@ RECOMP_PATCH void set_screen_scaling(void) {
         gScreenWidth = target_width;
     }
 
-    // Keep terminal right-column anchors in the 4:3 UI domain.
     sync_terminal_right_column_x();
+    sync_terminal_visible_queue_x();
 
     g_dbg_set_screen_scaling_calls++;
     if ((g_dbg_set_screen_scaling_calls <= 4) ||

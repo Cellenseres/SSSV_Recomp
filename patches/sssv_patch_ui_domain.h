@@ -70,21 +70,48 @@ static inline s32 terminal_ui_active(void) {
     return (gCameraUiState == 3) || (gCameraUiState == 4);
 }
 
+static inline s16 terminal_ui_width(void) {
+    return compute_target_width_for_height_patch(get_safe_screen_height());
+}
+
+static inline s16 terminal_text_layout_width(void) {
+    return ui_safe_width();
+}
+
+static inline s16 terminal_right_column_x_for_text(s16* text) {
+    s16 width = terminal_text_layout_width();
+    s16 x = (s16)(width - 14);
+
+    if (text != NULL) {
+        x = (s16)((width - get_message_width(text)) - 14);
+    }
+
+    return x;
+}
+
 static inline void sync_terminal_right_column_x(void) {
     s16 i;
-    s16 safe_width;
 
     if (!ui_is_expand_active() || !terminal_ui_active()) {
         return;
     }
 
-    safe_width = ui_safe_width();
     for (i = 0; i < 13; i++) {
-        s16 x = (s16)(safe_width - 14);
-        if (gTerminalStatText[i] != NULL) {
-            x = (s16)((safe_width - get_message_width(gTerminalStatText[i])) - 14);
+        gTerminalStatTextX[i] = terminal_right_column_x_for_text(gTerminalStatText[i]);
+    }
+}
+
+static inline void sync_terminal_visible_queue_x(void) {
+    s16 i;
+
+    if (!ui_is_expand_active() || !terminal_ui_active()) {
+        return;
+    }
+
+    for (i = 0; i < 13; i++) {
+        if (gTerminalTextScrollState.unk34[i] != NULL) {
+            gTerminalTextScrollState.unk68[i] = terminal_right_column_x_for_text(gTerminalTextScrollState.unk34[i]);
         }
-        gTerminalStatTextX[i] = x;
     }
 }
 

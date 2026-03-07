@@ -155,6 +155,27 @@ typedef struct {
 } Overlay2MenuState;
 
 typedef struct {
+    s8 unk0;
+    u8 unk1;
+    u8 unk2;
+    u8 unk3;
+} UiFlowStateMinimal;
+
+typedef struct {
+    s8 hasRumblePak[4];
+    u8 pad0004[0x3C];
+} ControllerMinimal;
+
+typedef struct {
+    s16* unk0[13];
+    s16* unk34[13];
+    s16 unk68[13];
+    s16 unk82;
+    s16 unk84;
+    s16 unk86;
+} TerminalTextScrollStateMinimal;
+
+typedef struct {
     /* 0x0 */ s16 unk0;
     /* 0x2 */ s16 unk2;
     /* 0x4 */ s16 unk4;
@@ -244,6 +265,13 @@ _Static_assert(sizeof(FogMinimal) == 0x8, "FogMinimal size mismatch");
 _Static_assert(offsetof(TrigLutMinimal, unk2D0) == 0x2D0, "TrigLutMinimal.unk2D0 offset mismatch");
 _Static_assert(sizeof(ScreenTransitionMinimal) == 0xA, "ScreenTransitionMinimal size mismatch");
 _Static_assert(offsetof(OverlayUiStateMinimal, unk48) == 0x48, "OverlayUiStateMinimal.unk48 offset mismatch");
+_Static_assert(sizeof(UiFlowStateMinimal) == 0x4, "UiFlowStateMinimal size mismatch");
+_Static_assert(sizeof(ControllerMinimal) == 0x40, "ControllerMinimal size mismatch");
+_Static_assert(offsetof(TerminalTextScrollStateMinimal, unk34) == 0x34, "TerminalTextScrollStateMinimal.unk34 offset mismatch");
+_Static_assert(offsetof(TerminalTextScrollStateMinimal, unk68) == 0x68, "TerminalTextScrollStateMinimal.unk68 offset mismatch");
+_Static_assert(offsetof(TerminalTextScrollStateMinimal, unk82) == 0x82, "TerminalTextScrollStateMinimal.unk82 offset mismatch");
+_Static_assert(offsetof(TerminalTextScrollStateMinimal, unk84) == 0x84, "TerminalTextScrollStateMinimal.unk84 offset mismatch");
+_Static_assert(offsetof(TerminalTextScrollStateMinimal, unk86) == 0x86, "TerminalTextScrollStateMinimal.unk86 offset mismatch");
 _Static_assert(sizeof(Light_t) == 0xC, "Light_t size mismatch");
 _Static_assert(sizeof(Ambient_t) == 0x8, "Ambient_t size mismatch");
 _Static_assert(sizeof(Light) == 0x10, "Light size mismatch");
