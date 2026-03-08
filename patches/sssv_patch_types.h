@@ -79,7 +79,9 @@ typedef struct {
 } VIDataMinimal;
 
 typedef struct {
-    u8 pad0000[0x32870];
+    u8 pad0000[0x2C570];
+    Vtx unk2C570[1000];
+    u8 pad303F0[0x2480];
     uSprite sprites[140];
     Mtx modelViewMtx[250];
     Mtx unk37410;
@@ -96,6 +98,26 @@ typedef struct {
     u8 pad38A50[0x8C0];
     u16 unk39310;
 } DisplayList;
+
+typedef struct {
+    s32 xPos;
+    s32 zPos;
+    s32 yPos;
+    u16 size;
+    u8 category;
+    s8 next;
+    s8 unk10;
+    u8 red;
+    u8 green;
+    u8 blue;
+} DynamicTextureMinimal;
+
+typedef struct {
+    s8 unk0;
+    s8 unk1;
+    s8 textureGroups[64];
+    DynamicTextureMinimal textures[75];
+} DynamicTexturesMinimal;
 
 typedef struct {
     s16 vscale[4];
@@ -248,6 +270,7 @@ _Static_assert(offsetof(LevelConfigMinimal, unkC) == 0x0C, "LevelConfigMinimal.u
 _Static_assert(offsetof(LevelConfigMinimal, unkE) == 0x0E, "LevelConfigMinimal.unkE offset mismatch");
 _Static_assert(offsetof(LevelConfigMinimal, unk42) == 0x42, "LevelConfigMinimal.unk42 offset mismatch");
 _Static_assert(offsetof(LevelConfigMinimal, fovY) == 0xE0, "LevelConfigMinimal.fovY offset mismatch");
+_Static_assert(offsetof(DisplayList, unk2C570) == 0x2C570, "DisplayList.unk2C570 offset mismatch");
 _Static_assert(offsetof(DisplayList, modelViewMtx) == 0x33590, "DisplayList.modelViewMtx offset mismatch");
 _Static_assert(offsetof(DisplayList, usedHilites) == 0x38910, "DisplayList.usedHilites offset mismatch");
 _Static_assert(offsetof(DisplayList, usedSprites) == 0x38914, "DisplayList.usedSprites offset mismatch");
@@ -255,6 +278,8 @@ _Static_assert(offsetof(DisplayList, usedModelViewMtxs) == 0x38918, "DisplayList
 _Static_assert(offsetof(DisplayList, usedVtxs) == 0x3891C, "DisplayList.usedVtxs offset mismatch");
 _Static_assert(offsetof(DisplayList, unk38A10) == 0x38A10, "DisplayList.unk38A10 offset mismatch");
 _Static_assert(offsetof(DisplayList, unk39310) == 0x39310, "DisplayList.unk39310 offset mismatch");
+_Static_assert(sizeof(DynamicTextureMinimal) == 0x14, "DynamicTextureMinimal size mismatch");
+_Static_assert(offsetof(DynamicTexturesMinimal, textures) == 0x44, "DynamicTexturesMinimal.textures offset mismatch");
 _Static_assert(offsetof(FrameContextMinimal, framebuffer) == 0x3BBE8, "FrameContextMinimal.framebuffer offset mismatch");
 _Static_assert(offsetof(CheatsMinimal, debugMode) == 0x06, "CheatsMinimal.debugMode offset mismatch");
 _Static_assert(offsetof(AnimalMinimal, health) == 0x14C, "AnimalMinimal.health offset mismatch");

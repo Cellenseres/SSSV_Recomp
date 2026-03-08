@@ -60,8 +60,10 @@ A Linux binary as well as a Flatpak is available for playing on most up-to-date 
 
 To play on Steam Deck, extract the Linux build onto your deck. Then, in desktop mode, right click the SSSVRecompiled executable file and select "Add to Steam". From there, you can return to Gaming mode and configure the controls as needed.
 
+## Added Features
+* Widescreen Support
+
 ## Planned Features
-* Widescreen support
 * Bugfixes regarding visual glitches
 * Ray Tracing via RT64
 
