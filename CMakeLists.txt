@@ -324,12 +324,16 @@ add_custom_command(
   OUTPUT ${SSSV_PATCH_RECOMP_OUTPUTS}
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/RecompiledPatches"
   COMMAND "${SSSV_RECOMP_TOOL}" "${SSSV_PATCH_RECOMP_CONFIG}"
+  COMMAND ${CMAKE_COMMAND}
+    -DINPUT_FILE="${CMAKE_SOURCE_DIR}/RecompiledPatches/patches.c"
+    -P "${CMAKE_SOURCE_DIR}/patches/fix_generated_patch_calls.cmake"
   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
   DEPENDS
     PatchesBin
     "${SSSV_PATCH_BUILD_DIR}/patches.elf"
     "${SSSV_PATCH_RECOMP_CONFIG}"
     "${CMAKE_SOURCE_DIR}/patches.toml"
+    "${CMAKE_SOURCE_DIR}/patches/fix_generated_patch_calls.cmake"
 )
 
 add_custom_command(

@@ -1,24 +1,32 @@
 #include "sssv_patch_common.h"
 #include "sssv_render_context.h"
-#include "sssv_patch_trace.h"
+#include "sssv_rt64_tagging.h"
 
 #define MTX_INTPART_PACK(w1, w2)  (((w1) & 0xFFFF0000) | (((w2) & 0xFFFF0000) >> 16))
 #define MTX_FRACPART_PACK(w1, w2) (((w1) << 16) | ((w2) & 0xFFFF))
 #define SQ(x) ((x) * (x))
 
-#define ENERGY_RGBA_TEX_PHYS_BASE 0x01040CB0u
-#define ENERGY_MASK_TEX_PHYS_BASE 0x0103ECB0u
-#define ENERGY_TEX_PHYS_WINDOW    0x00020000u
+#define BILLBOARD_FRAME_NONE 0xFFFFFFFFu
 
-#define ENERGY_DIAG_DL_WINDOW_CMDS 			4096u // max forward scan before tracker resets
-#define ENERGY_DIAG_BACKTRACK_CMDS_CURRENT 	1024  // backtrack limit in the current DL
-#define ENERGY_DIAG_BACKTRACK_CMDS_LAYER 	2048  // backtrack limit in layer0/aux DLs
-
-enum {
-    ENERGY_SRC_NONE = 0u,
-    ENERGY_SRC_RGBA = 1u << 0,
-    ENERGY_SRC_MASK = 1u << 1,
-};
+#define ENERGY_FRAME_COUNT             8u
+#define ENERGY_FRAME_MASK              (ENERGY_FRAME_COUNT - 1u)
+#define ENERGY_ANIM_PHASE_SHIFT        1u
+#define ENERGY_ANIM_PHASE_MASK         ((ENERGY_FRAME_COUNT * 2u) - 1u)
+#define ENERGY_COLOR_FRAME_SHIFT       11u
+#define ENERGY_MASK_FRAME_SHIFT        10u
+#define ENERGY_COLOR_IMAGE_WIDTH       1u
+#define ENERGY_MASK_IMAGE_WIDTH        32u
+#define BILLBOARD_TILE_COORD_MAX_32X32 124u
+#define BILLBOARD_TILE_MASK_BITS_32X32 5u
+#define ENERGY_COLOR_TILE_LINE         8u
+#define ENERGY_MASK_TILE_LINE          4u
+#define ENERGY_MASK_TILE_TMEM          0x0100u
+#define ENERGY_MASK_RENDER_TILE        1u
+#define ENERGY_COLOR_BLOCK_LRS         1023u
+#define ENERGY_COLOR_BLOCK_DXT         256u
+#define BILLBOARD_TRACKER_CAPACITY 128
+#define BILLBOARD_TRACKER_MATCH_WINDOW 256
+#define BILLBOARD_VERTEX_POOL_CAPACITY 1000
 
 static inline f32 f32_min(f32 a, f32 b) {
     return (a < b) ? a : b;
@@ -63,6 +71,41 @@ typedef struct {
     f32 bias_y4;
 } BillboardFamilyPolicy;
 
+typedef struct {
+    u32 family_id;
+    s32 world_x;
+    s32 world_z;
+    s32 world_y;
+    s32 sig0;
+    s32 sig1;
+    s32 sig2;
+    f32 z_clip;
+    f32 screen_left_x4;
+    f32 screen_right_x4;
+    f32 screen_down_y4;
+    f32 screen_up_y4;
+    s16 tex_u_max;
+    s16 tex_v_max;
+} BillboardGeometryDesc;
+
+typedef struct {
+    u32 stable_id;
+    s32 world_x;
+    s32 world_z;
+    s32 world_y;
+    s32 sig0;
+    s32 sig1;
+    s32 sig2;
+    u8 matched;
+} BillboardTrackedId;
+
+typedef struct {
+    BillboardTrackedId prev[BILLBOARD_TRACKER_CAPACITY];
+    BillboardTrackedId current[BILLBOARD_TRACKER_CAPACITY];
+    s32 prev_count;
+    s32 current_count;
+} BillboardTrackerState;
+
 typedef enum {
     BILLBOARD_CACHE_ROW_VIEW_X = 0,
     BILLBOARD_CACHE_ROW_VIEW_Y = 1,
@@ -99,23 +142,13 @@ static const BillboardFamilyPolicy s_billboard_family_policies[BILLBOARD_FAMILY_
     [BILLBOARD_FAMILY_MASK] = { 1000, 0, 0, 0.0f, 0.0f },
 };
 
-static u32 s_billboard_sample_frame[BILLBOARD_FAMILY_COUNT] = {
-    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu
-};
-static u32 s_energy_diag_frame = 0xFFFFFFFFu;
-static u32 s_energy_diag_count = 0;
-static u32 s_energy_settimg_emit_frame = 0xFFFFFFFFu;
-static u32 s_energy_rect_emit_frame = 0xFFFFFFFFu;
-static Gfx* s_energy_diag_last_dl = NULL;
-static u32 s_energy_diag_source_bits = ENERGY_SRC_NONE;
-static u32 s_energy_diag_last_settimg_phys = 0;
-
-static inline u32 bswap32_u32(u32 v) {
-    return ((v & 0x000000FFu) << 24) |
-           ((v & 0x0000FF00u) << 8) |
-           ((v & 0x00FF0000u) >> 8) |
-           ((v & 0xFF000000u) >> 24);
-}
+static BillboardTrackerState s_billboard_trackers[BILLBOARD_FAMILY_COUNT];
+static u32 s_billboard_tracker_frame = BILLBOARD_FRAME_NONE;
+static s32 s_billboard_signature_override_active = 0;
+static s32 s_billboard_signature_override_sig0 = 0;
+static s32 s_billboard_signature_override_sig1 = 0;
+static s32 s_billboard_signature_override_sig2 = 0;
+static s16 s_energy_anim_phase = 0;
 
 static inline s32 mul_permille_s32(s32 v, s32 permille) {
     return (v * permille) / 1000;
@@ -184,144 +217,399 @@ static inline f32 billboard_cache_eval_row(BillboardCacheRow row, f32 pos_x, f32
              (billboard_cache_value(row, BILLBOARD_CACHE_COEFF_X) * pos_x)));
 }
 
-static inline u32 energy_source_from_phys(u32 phys) {
-    if ((phys >= ENERGY_RGBA_TEX_PHYS_BASE) && (phys < (ENERGY_RGBA_TEX_PHYS_BASE + ENERGY_TEX_PHYS_WINDOW))) {
-        return ENERGY_SRC_RGBA;
-    }
-    if ((phys >= ENERGY_MASK_TEX_PHYS_BASE) && (phys < (ENERGY_MASK_TEX_PHYS_BASE + ENERGY_TEX_PHYS_WINDOW))) {
-        return ENERGY_SRC_MASK;
-    }
-    return ENERGY_SRC_NONE;
+static inline s32 energy_frame_index(void) {
+    return (s32)(((u16)s_energy_anim_phase >> ENERGY_ANIM_PHASE_SHIFT) & ENERGY_FRAME_MASK);
 }
 
-static inline u32 energy_source_from_gfx_cmd(const Gfx* cmd, u32* out_phys) {
-    u32 w0_candidates[2];
-    u32 w1_candidates[2];
-    int i, j;
-    if (cmd == NULL) {
-        return ENERGY_SRC_NONE;
+static inline void* energy_color_frame_ptr(s32 frame) {
+    return img_D_01040CB0_7A580_rgba16__png + ((frame & ENERGY_FRAME_MASK) << ENERGY_COLOR_FRAME_SHIFT);
+}
+
+static inline void* energy_mask_frame_ptr(s32 frame) {
+    return D_0103ECB0_78580 + ((frame & ENERGY_FRAME_MASK) << ENERGY_MASK_FRAME_SHIFT);
+}
+
+static inline void energy_set_wrap_tile(Gfx **dl, u32 fmt, u32 siz, u32 line, u32 tmem, u32 tile) {
+    gDPSetTile(
+        (*dl)++,
+        fmt, siz, line, tmem, tile, 0,
+        G_TX_NOMIRROR | G_TX_WRAP, BILLBOARD_TILE_MASK_BITS_32X32, G_TX_NOLOD,
+        G_TX_NOMIRROR | G_TX_WRAP, BILLBOARD_TILE_MASK_BITS_32X32, G_TX_NOLOD
+    );
+}
+
+static inline void energy_set_32x32_tile_size(Gfx **dl, u32 tile) {
+    gDPSetTileSize((*dl)++, tile, 0, 0, BILLBOARD_TILE_COORD_MAX_32X32, BILLBOARD_TILE_COORD_MAX_32X32);
+}
+
+static inline void setup_energy_billboard_material(Gfx **dl, s32 frame) {
+    void* color_ptr;
+    void* mask_ptr;
+
+    frame &= ENERGY_FRAME_MASK;
+    color_ptr = energy_color_frame_ptr(frame);
+    mask_ptr = energy_mask_frame_ptr(frame);
+
+    gDPSetTextureImage((*dl)++, G_IM_FMT_RGBA, G_IM_SIZ_16b, ENERGY_COLOR_IMAGE_WIDTH, OS_PHYSICAL_TO_K0(color_ptr));
+    energy_set_wrap_tile(dl, G_IM_FMT_RGBA, G_IM_SIZ_16b, 0, 0x0000, G_TX_LOADTILE);
+    gDPLoadSync((*dl)++);
+    gDPLoadBlock((*dl)++, G_TX_LOADTILE, 0, 0, ENERGY_COLOR_BLOCK_LRS, ENERGY_COLOR_BLOCK_DXT);
+    gDPPipeSync((*dl)++);
+    energy_set_wrap_tile(dl, G_IM_FMT_RGBA, G_IM_SIZ_16b, ENERGY_COLOR_TILE_LINE, 0x0000, G_TX_RENDERTILE);
+    energy_set_32x32_tile_size(dl, G_TX_RENDERTILE);
+
+    gDPSetTextureImage((*dl)++, G_IM_FMT_I, G_IM_SIZ_8b, ENERGY_MASK_IMAGE_WIDTH, (void*)(((u32)(uintptr_t)mask_ptr) + 0x80000000u));
+    energy_set_wrap_tile(dl, G_IM_FMT_I, G_IM_SIZ_8b, ENERGY_MASK_TILE_LINE, ENERGY_MASK_TILE_TMEM, G_TX_LOADTILE);
+    gDPLoadSync((*dl)++);
+    gDPLoadTile((*dl)++, G_TX_LOADTILE, 0, 0, BILLBOARD_TILE_COORD_MAX_32X32, BILLBOARD_TILE_COORD_MAX_32X32);
+    gDPPipeSync((*dl)++);
+    energy_set_wrap_tile(dl, G_IM_FMT_I, G_IM_SIZ_8b, ENERGY_MASK_TILE_LINE, ENERGY_MASK_TILE_TMEM, ENERGY_MASK_RENDER_TILE);
+    energy_set_32x32_tile_size(dl, ENERGY_MASK_RENDER_TILE);
+    gDPSetCombineLERP(
+        (*dl)++,
+        PRIMITIVE, 0, TEXEL0, 0,
+        PRIMITIVE, 0, TEXEL1, 0,
+        0, 0, 0, COMBINED,
+        0, 0, 0, COMBINED
+    );
+}
+
+static inline s32 billboard_abs_i32(s32 value) {
+    return (value < 0) ? -value : value;
+}
+
+static inline f32 billboard_abs_f32(f32 value) {
+    return (value < 0.0f) ? -value : value;
+}
+
+static inline f32 billboard_sqrt_f32(f32 value) {
+    return __builtin_sqrtf(value);
+}
+
+static inline void billboard_copy_tracked_ids(BillboardTrackedId* dst, const BillboardTrackedId* src, s32 count) {
+    s32 i;
+
+    for (i = 0; i < count; i++) {
+        dst[i] = src[i];
+    }
+}
+
+static inline s32 billboard_is_geometry_family(u32 family_id) {
+    return (family_id == BILLBOARD_FAMILY_STAR) ||
+           (family_id == BILLBOARD_FAMILY_ENERGY) ||
+           (family_id == BILLBOARD_FAMILY_COLLECTIBLE) ||
+           (family_id == BILLBOARD_FAMILY_DUALSCALE);
+}
+
+static inline void billboard_signature_override_begin(s32 sig0, s32 sig1, s32 sig2) {
+    s_billboard_signature_override_active = 1;
+    s_billboard_signature_override_sig0 = sig0;
+    s_billboard_signature_override_sig1 = sig1;
+    s_billboard_signature_override_sig2 = sig2;
+}
+
+static inline void billboard_signature_override_end(void) {
+    s_billboard_signature_override_active = 0;
+    s_billboard_signature_override_sig0 = 0;
+    s_billboard_signature_override_sig1 = 0;
+    s_billboard_signature_override_sig2 = 0;
+}
+
+static inline BillboardTrackerState* billboard_tracker_for_family(u32 family_id) {
+    if (!billboard_is_geometry_family(family_id)) {
+        return NULL;
+    }
+    return &s_billboard_trackers[family_id];
+}
+
+static inline void billboard_tracker_begin_frame(void) {
+    s32 family_id;
+    u32 frame = rc_frame_index();
+    s32 drop_prev = 0;
+
+    if (s_billboard_tracker_frame == frame) {
+        return;
     }
 
-    w0_candidates[0] = cmd->words.w0;
-    w0_candidates[1] = bswap32_u32(cmd->words.w0);
-    w1_candidates[0] = cmd->words.w1;
-    w1_candidates[1] = bswap32_u32(cmd->words.w1);
+    if ((s_billboard_tracker_frame == BILLBOARD_FRAME_NONE) || ((s_billboard_tracker_frame + 1u) != frame) || (skip_perspective_interpolation != 0)) {
+        drop_prev = 1;
+    }
 
-    for (i = 0; i < 2; i++) {
-        u32 op = (w0_candidates[i] >> 24) & 0xFFu;
-        if (op != G_SETTIMG) {
+    for (family_id = BILLBOARD_FAMILY_STAR; family_id <= BILLBOARD_FAMILY_DUALSCALE; family_id++) {
+        BillboardTrackerState* tracker = &s_billboard_trackers[family_id];
+        s32 i;
+
+        if (drop_prev != 0) {
+            tracker->prev_count = 0;
+        } else {
+            tracker->prev_count = tracker->current_count;
+            billboard_copy_tracked_ids(tracker->prev, tracker->current, tracker->current_count);
+            for (i = 0; i < tracker->prev_count; i++) {
+                tracker->prev[i].matched = 0;
+            }
+        }
+
+        tracker->current_count = 0;
+    }
+
+    s_billboard_tracker_frame = frame;
+}
+
+static inline void billboard_resolve_signature(const BillboardGeometryDesc* desc, s32* sig0, s32* sig1, s32* sig2) {
+    if (s_billboard_signature_override_active != 0) {
+        *sig0 = s_billboard_signature_override_sig0;
+        *sig1 = s_billboard_signature_override_sig1;
+        *sig2 = s_billboard_signature_override_sig2;
+    } else {
+        *sig0 = desc->sig0;
+        *sig1 = desc->sig1;
+        *sig2 = desc->sig2;
+    }
+}
+
+static inline s32 billboard_acquire_stable_id(const BillboardGeometryDesc* desc, u32* out_stable_id) {
+    BillboardTrackerState* tracker;
+    s32 cur_world_x;
+    s32 cur_world_z;
+    s32 cur_world_y;
+    s32 sig0;
+    s32 sig1;
+    s32 sig2;
+    s32 best_index = -1;
+    s32 best_distance = 0x7FFFFFFF;
+    s32 i;
+    BillboardTrackedId* cur_entry;
+
+    if ((out_stable_id == NULL) || !billboard_is_geometry_family(desc->family_id)) {
+        return 0;
+    }
+
+    billboard_tracker_begin_frame();
+    tracker = billboard_tracker_for_family(desc->family_id);
+    if (tracker == NULL) {
+        return 0;
+    }
+
+    if (tracker->current_count >= BILLBOARD_TRACKER_CAPACITY) {
+        return 0;
+    }
+
+    cur_world_x = desc->world_x >> 16;
+    cur_world_z = desc->world_z >> 16;
+    cur_world_y = desc->world_y >> 16;
+    billboard_resolve_signature(desc, &sig0, &sig1, &sig2);
+
+    for (i = 0; i < tracker->prev_count; i++) {
+        BillboardTrackedId* prev_entry = &tracker->prev[i];
+        s32 dx;
+        s32 dz;
+        s32 dy;
+        s32 distance;
+
+        if (prev_entry->matched != 0) {
+            continue;
+        }
+        if ((prev_entry->sig0 != sig0) || (prev_entry->sig1 != sig1) || (prev_entry->sig2 != sig2)) {
             continue;
         }
 
-        for (j = 0; j < 2; j++) {
-            u32 phys = w1_candidates[j] & 0x1FFFFFFFu;
-            u32 src = energy_source_from_phys(phys);
-            if (src != ENERGY_SRC_NONE) {
-                if (out_phys != NULL) {
-                    *out_phys = phys;
-                }
-                return src;
-            }
+        dx = billboard_abs_i32(prev_entry->world_x - cur_world_x);
+        dz = billboard_abs_i32(prev_entry->world_z - cur_world_z);
+        dy = billboard_abs_i32(prev_entry->world_y - cur_world_y);
+        if ((dx > BILLBOARD_TRACKER_MATCH_WINDOW) || (dz > BILLBOARD_TRACKER_MATCH_WINDOW) || (dy > BILLBOARD_TRACKER_MATCH_WINDOW)) {
+            continue;
         }
 
-        if (out_phys != NULL) {
-            *out_phys = w1_candidates[0] & 0x1FFFFFFFu;
+        distance = dx + dz + dy;
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_index = i;
         }
     }
 
-    return ENERGY_SRC_NONE;
+    if (best_index >= 0) {
+        *out_stable_id = tracker->prev[best_index].stable_id;
+        tracker->prev[best_index].matched = 1;
+    } else {
+        *out_stable_id = rc_alloc_billboard_transform_id((RcBillboardFamily)desc->family_id);
+    }
+
+    cur_entry = &tracker->current[tracker->current_count++];
+    cur_entry->stable_id = *out_stable_id;
+    cur_entry->world_x = cur_world_x;
+    cur_entry->world_z = cur_world_z;
+    cur_entry->world_y = cur_world_y;
+    cur_entry->sig0 = sig0;
+    cur_entry->sig1 = sig1;
+    cur_entry->sig2 = sig2;
+    cur_entry->matched = 0;
+    return 1;
 }
 
-static inline void energy_diag_emit(u32 tag, u32 a, u32 b, u32 c) {
-    u32* last_emit_frame = NULL;
-    u32 frame = rc_frame_index();
-
-    if ((sssv_patch_diag_flags & (SSSV_DIAG_BILLBOARD | SSSV_DIAG_WARN)) == 0u) {
-        return;
+static inline s16 billboard_round_to_s16(f32 value) {
+    if (value >= 32767.0f) {
+        return 32767;
     }
-    if (tag == PATCH_TAG_ENERGY_SETTIMG_SEEN) {
-        last_emit_frame = &s_energy_settimg_emit_frame;
-    } else if (tag == PATCH_TAG_ENERGY_RECT_EMIT) {
-        last_emit_frame = &s_energy_rect_emit_frame;
+    if (value <= -32768.0f) {
+        return -32768;
     }
-
-    if ((last_emit_frame != NULL) && ((*last_emit_frame != 0xFFFFFFFFu) && ((frame - *last_emit_frame) < 20u))) {
-        return;
-    }
-    if (s_energy_diag_count >= 2u) {
-        return;
-    }
-
-    if (last_emit_frame != NULL) {
-        *last_emit_frame = frame;
-    }
-    s_energy_diag_count++;
-    PATCH_TRACE_DIAG(SSSV_DIAG_WARN, tag, a, b, c);
+    return (s16)((value >= 0.0f) ? (value + 0.5f) : (value - 0.5f));
 }
 
-static inline void energy_diag_absorb_cmd(const Gfx* cmd) {
-    u32 phys = 0;
-    u32 src = energy_source_from_gfx_cmd(cmd, &phys);
-    if (phys != 0u) {
-        s_energy_diag_last_settimg_phys = phys;
+static inline s32 billboard_extract_basis_vectors(
+    f32* right_x,
+    f32* right_z,
+    f32* right_y,
+    f32* up_x,
+    f32* up_z,
+    f32* up_y
+) {
+    f32 rx = billboard_cache_value(BILLBOARD_CACHE_ROW_VIEW_X, BILLBOARD_CACHE_COEFF_X);
+    f32 rz = billboard_cache_value(BILLBOARD_CACHE_ROW_VIEW_X, BILLBOARD_CACHE_COEFF_Y);
+    f32 ry = billboard_cache_value(BILLBOARD_CACHE_ROW_VIEW_X, BILLBOARD_CACHE_COEFF_Z);
+    f32 ux = billboard_cache_value(BILLBOARD_CACHE_ROW_VIEW_Y, BILLBOARD_CACHE_COEFF_X);
+    f32 uz = billboard_cache_value(BILLBOARD_CACHE_ROW_VIEW_Y, BILLBOARD_CACHE_COEFF_Y);
+    f32 uy = billboard_cache_value(BILLBOARD_CACHE_ROW_VIEW_Y, BILLBOARD_CACHE_COEFF_Z);
+    f32 r_len = billboard_sqrt_f32((rx * rx) + (rz * rz) + (ry * ry));
+    f32 u_len = billboard_sqrt_f32((ux * ux) + (uz * uz) + (uy * uy));
+
+    if ((r_len <= 0.0001f) || (u_len <= 0.0001f)) {
+        return 0;
     }
-    if (src != ENERGY_SRC_NONE) {
-        s_energy_diag_source_bits |= src;
-    }
+
+    *right_x = rx / r_len;
+    *right_z = rz / r_len;
+    *right_y = ry / r_len;
+    *up_x = ux / u_len;
+    *up_z = uz / u_len;
+    *up_y = uy / u_len;
+    return 1;
 }
 
-static inline void energy_diag_backtrack(Gfx* dl, s32 max_cmds) {
-    Gfx* cmd = dl;
-    s32 i = 0;
-    const u32 wanted = ENERGY_SRC_RGBA | ENERGY_SRC_MASK;
+static inline s32 billboard_screen_extent_to_world_half(
+    f32 z_clip,
+    f32 screen_extent_x4,
+    f32 screen_extent_y4,
+    f32* out_world_x,
+    f32* out_world_y
+) {
+    f32 screen_row_x = billboard_abs_f32(billboard_cache_value(BILLBOARD_CACHE_ROW_SCREEN, BILLBOARD_CACHE_COEFF_X));
+    f32 screen_row_y = billboard_abs_f32(billboard_cache_value(BILLBOARD_CACHE_ROW_SCREEN, BILLBOARD_CACHE_COEFF_Y));
 
-    if (cmd == NULL) {
-        return;
+    if ((screen_row_x <= 0.0001f) || (screen_row_y <= 0.0001f)) {
+        return 0;
     }
 
-    while ((i < max_cmds) && (cmd != NULL)) {
-        cmd--;
-        i++;
-        energy_diag_absorb_cmd(cmd);
-        if ((s_energy_diag_source_bits & wanted) == wanted) {
-            break;
-        }
-    }
+    *out_world_x = screen_extent_x4 * (-z_clip) / screen_row_x;
+    *out_world_y = screen_extent_y4 * (-z_clip) / screen_row_y;
+    return 1;
 }
 
-static inline void energy_diag_refresh(Gfx* dl) {
-    u32 frame = rc_frame_index();
-    if ((sssv_patch_diag_flags & (SSSV_DIAG_BILLBOARD | SSSV_DIAG_WARN)) == 0u) {
-        return;
+static inline void billboard_write_vertex(Vtx* vertex, f32 x, f32 z, f32 y, s16 tc_s, s16 tc_t) {
+    vertex->v.ob[0] = billboard_round_to_s16(x);
+    vertex->v.ob[1] = billboard_round_to_s16(z);
+    vertex->v.ob[2] = billboard_round_to_s16(y);
+    vertex->v.flag = 0;
+    vertex->v.tc[0] = tc_s;
+    vertex->v.tc[1] = tc_t;
+    vertex->v.cn[0] = 0xFF;
+    vertex->v.cn[1] = 0xFF;
+    vertex->v.cn[2] = 0xFF;
+    vertex->v.cn[3] = 0xFF;
+}
+
+static inline s16 billboard_tc_from_texel_max(s16 texel_max) {
+    return (s16)(texel_max << 7);
+}
+
+static inline s32 billboard_emit_world_quad(const BillboardGeometryDesc* desc, Gfx** dl) {
+    f32 right_x;
+    f32 right_z;
+    f32 right_y;
+    f32 up_x;
+    f32 up_z;
+    f32 up_y;
+    f32 world_left;
+    f32 world_right;
+    f32 world_down;
+    f32 world_up;
+    f32 center_x;
+    f32 center_z;
+    f32 center_y;
+    u32 stable_id;
+    s32 vtx_index;
+    Vtx* vertices;
+
+    if ((dl == NULL) || ((*dl) == NULL) || !billboard_is_geometry_family(desc->family_id)) {
+        return 0;
+    }
+    if ((gDisplayListContext == NULL) || (gDisplayListContext->usedVtxs < 0)) {
+        return 0;
+    }
+    if ((gDisplayListContext->usedVtxs + 4) > BILLBOARD_VERTEX_POOL_CAPACITY) {
+        return 0;
+    }
+    if (!billboard_extract_basis_vectors(&right_x, &right_z, &right_y, &up_x, &up_z, &up_y)) {
+        return 0;
+    }
+    if (!billboard_screen_extent_to_world_half(desc->z_clip, desc->screen_left_x4, desc->screen_down_y4, &world_left, &world_down) ||
+        !billboard_screen_extent_to_world_half(desc->z_clip, desc->screen_right_x4, desc->screen_up_y4, &world_right, &world_up)) {
+        return 0;
+    }
+    if (!billboard_acquire_stable_id(desc, &stable_id)) {
+        return 0;
     }
 
-    if (frame != s_energy_diag_frame) {
-        s_energy_diag_frame = frame;
-        s_energy_diag_count = 0;
-        s_energy_diag_last_dl = NULL;
-        s_energy_diag_source_bits = ENERGY_SRC_NONE;
-        s_energy_diag_last_settimg_phys = 0;
-    }
+    vtx_index = gDisplayListContext->usedVtxs;
+    vertices = &gDisplayListContext->unk2C570[vtx_index];
+    center_x = desc->world_x / 65536.0f;
+    center_z = desc->world_z / 65536.0f;
+    center_y = desc->world_y / 65536.0f;
 
-    if (dl != NULL) {
-        if ((s_energy_diag_last_dl != NULL) && (dl >= s_energy_diag_last_dl) && (dl <= (s_energy_diag_last_dl + ENERGY_DIAG_DL_WINDOW_CMDS))) {
-            while (s_energy_diag_last_dl < dl) {
-                energy_diag_absorb_cmd(s_energy_diag_last_dl);
-                s_energy_diag_last_dl++;
-            }
-        }
-        s_energy_diag_last_dl = dl;
-    }
+    billboard_write_vertex(
+        &vertices[0],
+        center_x - (right_x * world_left) - (up_x * world_down),
+        center_z - (right_z * world_left) - (up_z * world_down),
+        center_y - (right_y * world_left) - (up_y * world_down),
+        0,
+        billboard_tc_from_texel_max(desc->tex_v_max)
+    );
+    billboard_write_vertex(
+        &vertices[1],
+        center_x + (right_x * world_right) - (up_x * world_down),
+        center_z + (right_z * world_right) - (up_z * world_down),
+        center_y + (right_y * world_right) - (up_y * world_down),
+        billboard_tc_from_texel_max(desc->tex_u_max),
+        billboard_tc_from_texel_max(desc->tex_v_max)
+    );
+    billboard_write_vertex(
+        &vertices[2],
+        center_x + (right_x * world_right) + (up_x * world_up),
+        center_z + (right_z * world_right) + (up_z * world_up),
+        center_y + (right_y * world_right) + (up_y * world_up),
+        billboard_tc_from_texel_max(desc->tex_u_max),
+        0
+    );
+    billboard_write_vertex(
+        &vertices[3],
+        center_x - (right_x * world_left) + (up_x * world_up),
+        center_z - (right_z * world_left) + (up_z * world_up),
+        center_y - (right_y * world_left) + (up_y * world_up),
+        0,
+        0
+    );
 
-    if (s_energy_diag_source_bits == ENERGY_SRC_NONE) {
-        energy_diag_backtrack(dl, ENERGY_DIAG_BACKTRACK_CMDS_CURRENT);
-    }
-    if (s_energy_diag_source_bits == ENERGY_SRC_NONE) {
-        energy_diag_backtrack(gLayer0DL, ENERGY_DIAG_BACKTRACK_CMDS_LAYER);
-    }
-    if (s_energy_diag_source_bits == ENERGY_SRC_NONE) {
-        energy_diag_backtrack(gAuxDL, ENERGY_DIAG_BACKTRACK_CMDS_LAYER);
-    }
+    gDisplayListContext->usedVtxs += 4;
+
+    gSPMatrix((*dl)++, &gDisplayListContext->unk374D0, G_MTX_PUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+    rt64_tag_model_matrix(dl, stable_id, 1);
+    gDPSetDepthSource((*dl)++, G_ZS_PIXEL);
+    gSPVertex((*dl)++, &gDisplayListContext->unk2C570[vtx_index], 4, 0);
+    gSP1Triangle((*dl)++, 0, 1, 2, 0);
+    gSP1Triangle((*dl)++, 0, 2, 3, 0);
+    rt64_pop_model_matrix(dl);
+    gSPPopMatrix((*dl)++, G_MTX_MODELVIEW);
+    return 1;
 }
 
 static inline s32 billboard_scale_size_by_fovy(s32 value) {
@@ -358,7 +646,7 @@ static inline f32 billboard_project_screen_y4(const BillboardScreenSpace* space,
 }
 
 static inline u16 billboard_compute_prim_depth(f32 depth_factor) {
-    return (u16)((depth_factor * 1023.0f * 32.0f) + 32736.0f);
+    return (u16)((depth_factor * 1023.0f * ENERGY_MASK_IMAGE_WIDTH) + 32736.0f);
 }
 
 static inline u8 billboard_compute_fog_alpha(f32 depth_factor) {
@@ -483,47 +771,6 @@ static inline s32 billboard_rect_intersects_clip(const BillboardClipBounds* clip
     return (xl < clip->right) && (yl < clip->bottom) && (xh > clip->left) && (yh > clip->top);
 }
 
-static inline void emit_billboard_sample_once(
-    u32 family,
-    s32 world_x,
-    s32 world_y,
-    s32 world_z,
-    f32 screen_x4,
-    f32 screen_y4
-) {
-    u32 frame;
-    u32 packed_screen;
-    u32 packed_world;
-
-    if ((family >= BILLBOARD_FAMILY_COUNT) || ((sssv_patch_diag_flags & SSSV_DIAG_BILLBOARD) == 0u)) {
-        return;
-    }
-
-    frame = rc_frame_index();
-    if (s_billboard_sample_frame[family] == frame) {
-        return;
-    }
-    s_billboard_sample_frame[family] = frame;
-
-    packed_screen = ((u32)(u16)((s32)screen_x4) << 16) | (u16)((s32)screen_y4);
-    packed_world = ((u32)(u16)(world_x >> 16) << 16) | (u16)(world_y >> 16);
-
-    PATCH_TRACE_DIAG(
-        SSSV_DIAG_BILLBOARD,
-        PATCH_TAG_BILLBOARD_SAMPLE,
-        (frame << 8) | family,
-        packed_world,
-        ((u32)(u16)(world_z >> 16) << 16) | ((u32)(u16)cur_perspective_projection_transform_id)
-    );
-    PATCH_TRACE_DIAG(
-        SSSV_DIAG_BILLBOARD,
-        PATCH_TAG_BILLBOARD_SAMPLE,
-        ((frame << 8) | family) ^ 0x80000000u,
-        packed_screen,
-        ((u32)(u16)gScreenWidth << 16) | (u16)gScreenHeight
-    );
-}
-
 static inline s32 project_billboard_to_screen(
     u32 family_id,
     const BillboardFamilyPolicy* policy,
@@ -550,18 +797,10 @@ static inline s32 project_billboard_to_screen(
 
     out->screen_x4 += policy->bias_x4;
     out->screen_y4 += policy->bias_y4;
-    emit_billboard_sample_once(family_id, world_x, world_y, world_z, out->screen_x4, out->screen_y4);
     return 1;
 }
 
-static inline void append_tagged_billboard_texrect(
-    u32 family_id,
-    s32 world_x,
-    s32 world_y,
-    s32 world_z,
-    s32 sig0,
-    s32 sig1,
-    s32 sig2,
+static inline void append_legacy_billboard_texrect(
     Gfx** dl,
     s16 xl,
     s16 yl,
@@ -572,15 +811,25 @@ static inline void append_tagged_billboard_texrect(
     s16 dsdx,
     s16 dtdy
 ) {
-    (void)family_id;
-    (void)world_x;
-    (void)world_y;
-    (void)world_z;
-    (void)sig0;
-    (void)sig1;
-    (void)sig2;
     gSPScisTextureRectangle(*dl, xl, yl, xh, yh, G_TX_RENDERTILE, s, t, dsdx, dtdy);
     *dl += 3;
+}
+
+static inline void emit_billboard_geometry_or_fallback(
+    const BillboardGeometryDesc* desc,
+    Gfx** dl,
+    s16 xl,
+    s16 yl,
+    s16 xh,
+    s16 yh,
+    s16 s,
+    s16 t,
+    s16 dsdx,
+    s16 dtdy
+) {
+    if (!billboard_emit_world_quad(desc, dl)) {
+        append_legacy_billboard_texrect(dl, xl, yl, xh, yh, s, t, dsdx, dtdy);
+    }
 }
 
 static inline void append_tagged_worldmask_texrect(Gfx** dl, s16 xl, s16 yl, s16 xh, s16 yh, s16 s, s16 t, s16 dsdx, s16 dtdy) {
@@ -640,20 +889,13 @@ RECOMP_PATCH void update_billboard_projection_cache(void) {
     billboard_cache_store_row(BILLBOARD_CACHE_ROW_VIEW_Y, view_y_mul_x, view_y_mul_y, view_y_mul_z, view_y_bias);
     billboard_cache_store_row(BILLBOARD_CACHE_ROW_Z_CLIP, clip_mul_x, clip_mul_y, clip_mul_z, clip_bias);
     billboard_cache_store_row(BILLBOARD_CACHE_ROW_SCREEN, screen_scale_x, screen_scale_y, depth_mul, depth_bias);
-
-    emit_billboard_sample_once(
-        BILLBOARD_FAMILY_CACHE,
-        ((s32)gCameraEyeWorldX) << 16,
-        ((s32)gCameraEyeWorldZ) << 16,
-        ((s32)gCameraEyeWorldY) << 16,
-        0.0f,
-        0.0f
-    );
 }
 
 RECOMP_PATCH void draw_star_billboard_texrect(Gfx **dl, s32 world_x, s32 world_z, s32 world_y, s16 tex_half_width, s16 tex_half_height, s32 sprite_scale) {
     BillboardProjection projection;
     f32 size_x4;
+    f32 xOffset;
+    f32 yOffset;
     f32 xl;
     f32 yl;
     f32 xh;
@@ -661,13 +903,12 @@ RECOMP_PATCH void draw_star_billboard_texrect(Gfx **dl, s32 world_x, s32 world_z
     s16 dsdx;
     s16 dtdy;
     BillboardScreenSpace space;
-    BillboardClipBounds clip;
     const BillboardFamilyPolicy* policy;
+    BillboardGeometryDesc geometry_desc;
 
     rc_note_texrect_context(TRC_WORLD_BILLBOARD, 0x6C5E44u);
     space = get_billboard_space();
     policy = get_billboard_family_policy(BILLBOARD_FAMILY_STAR);
-    clip = get_billboard_clip_bounds(&space, policy);
     if (project_billboard_to_screen(BILLBOARD_FAMILY_STAR, policy, world_x, world_z, world_y, &space, &projection)) {
         if (projection.depth_factor > 0.0f) {
             sprite_scale = billboard_scale_size_by_fovy(sprite_scale);
@@ -682,35 +923,43 @@ RECOMP_PATCH void draw_star_billboard_texrect(Gfx **dl, s32 world_x, s32 world_z
             }
 
             if (size_x4 > 0.0f) {
-                xl = projection.screen_x4 - ((tex_half_width * size_x4) / 128.0f);
-                xh = projection.screen_x4 + ((tex_half_width * size_x4) / 128.0f);
-                yl = projection.screen_y4 - ((tex_half_height * size_x4) / 128.0f);
-                yh = projection.screen_y4 + 2.0f;
+                xOffset = (tex_half_width * size_x4) / 128.0f;
+                yOffset = (tex_half_height * size_x4) / 128.0f;
+                xl = projection.screen_x4 - xOffset;
+                xh = projection.screen_x4 + xOffset;
+                yl = projection.screen_y4 - yOffset;
+                yh = projection.screen_y4 + yOffset;
 
                 if ((xl < xh) && (yl < yh)) {
                     dsdx = (s16)((tex_half_height << 12) / (xh - xl));
                     dtdy = (s16)((tex_half_width << 12) / (yh - yl));
+                    geometry_desc.family_id = BILLBOARD_FAMILY_STAR;
+                    geometry_desc.world_x = world_x;
+                    geometry_desc.world_z = world_z;
+                    geometry_desc.world_y = world_y;
+                    geometry_desc.sig0 = tex_half_width;
+                    geometry_desc.sig1 = tex_half_height;
+                    geometry_desc.sig2 = sprite_scale;
+                    geometry_desc.z_clip = projection.z_clip;
+                    geometry_desc.screen_left_x4 = xOffset;
+                    geometry_desc.screen_right_x4 = xOffset;
+                    geometry_desc.screen_down_y4 = yOffset;
+                    geometry_desc.screen_up_y4 = yOffset;
+                    geometry_desc.tex_u_max = tex_half_height;
+                    geometry_desc.tex_v_max = tex_half_width;
 
-                    if (billboard_rect_intersects_clip(&clip, xl, yl, xh, yh)) {
-                        append_tagged_billboard_texrect(
-                            BILLBOARD_FAMILY_STAR,
-                            world_x,
-                            world_z,
-                            world_y,
-                            tex_half_width,
-                            tex_half_height,
-                            sprite_scale,
-                            dl,
-                            (s16)xl,
-                            (s16)yl,
-                            (s16)xh,
-                            (s16)yh,
-                            (s16)((dsdx * ((s16)xl & 3)) >> 9),
-                            (s16)(-(dtdy * ((s16)yl & 3)) >> 7),
-                            dsdx,
-                            dtdy
-                        );
-                    }
+                    emit_billboard_geometry_or_fallback(
+                        &geometry_desc,
+                        dl,
+                        (s16)xl,
+                        (s16)yl,
+                        (s16)xh,
+                        (s16)yh,
+                        (s16)((dsdx * ((s16)xl & 3)) >> 9),
+                        (s16)(-(dtdy * ((s16)yl & 3)) >> 7),
+                        dsdx,
+                        dtdy
+                    );
                 }
             }
         }
@@ -729,32 +978,17 @@ RECOMP_PATCH void draw_energy_billboard_texrect(Gfx **dl, s32 world_x, s32 world
     s16 dsdx;
     s16 dtdy;
     BillboardScreenSpace space;
-    BillboardClipBounds clip;
     const BillboardFamilyPolicy* policy;
-    s32 diag_reason = 0;
-    s16 diag_screen_x = 0;
-    s16 diag_screen_y = 0;
-    s16 diag_xl = 0;
-    s16 diag_yl = 0;
-    s16 diag_xh = 0;
-    s16 diag_yh = 0;
-    u32 diag_source_bits = ENERGY_SRC_NONE;
-    u32 diag_source_phys = 0;
+    BillboardGeometryDesc geometry_desc;
     dsdx = 0;
     dtdy = 0;
 
     rc_note_texrect_context(TRC_WORLD_BILLBOARD, 0x73F17Cu);
-    energy_diag_refresh((dl != NULL) ? *dl : NULL);
     space = get_billboard_space();
     policy = get_billboard_family_policy(BILLBOARD_FAMILY_ENERGY);
-    clip = get_billboard_clip_bounds(&space, policy);
-    diag_source_bits = s_energy_diag_source_bits;
-    diag_source_phys = s_energy_diag_last_settimg_phys;
 
     if (project_billboard_to_screen(BILLBOARD_FAMILY_ENERGY, policy, world_x, world_z, world_y, &space, &projection)) {
         if (projection.depth_factor > 0.0f) {
-            diag_screen_x = (s16)projection.screen_x4;
-            diag_screen_y = (s16)projection.screen_y4;
             sprite_scale = billboard_scale_size_by_fovy(sprite_scale);
             size_x4 = (sprite_scale * 32) / -projection.z_clip;
             size_x4 = mul_permille_f32(size_x4, policy->size_permille);
@@ -773,64 +1007,40 @@ RECOMP_PATCH void draw_energy_billboard_texrect(Gfx **dl, s32 world_x, s32 world
 
                 xh = projection.screen_x4 + xOffset;
                 yh = projection.screen_y4 + yOffset;
-                diag_xl = (s16)xl;
-                diag_yl = (s16)yl;
-                diag_xh = (s16)xh;
-                diag_yh = (s16)yh;
 
                 if ((xl < xh) && (yl < yh)) {
                     dsdx = (s16)((tex_half_width << 12) / (yh - yl));
                     dtdy = (s16)((tex_half_height << 12) / (xh - xl));
+                    geometry_desc.family_id = BILLBOARD_FAMILY_ENERGY;
+                    geometry_desc.world_x = world_x;
+                    geometry_desc.world_z = world_z;
+                    geometry_desc.world_y = world_y;
+                    geometry_desc.sig0 = tex_half_width;
+                    geometry_desc.sig1 = tex_half_height;
+                    geometry_desc.sig2 = sprite_scale;
+                    geometry_desc.z_clip = projection.z_clip;
+                    geometry_desc.screen_left_x4 = xOffset;
+                    geometry_desc.screen_right_x4 = xOffset;
+                    geometry_desc.screen_down_y4 = yOffset;
+                    geometry_desc.screen_up_y4 = yOffset;
+                    geometry_desc.tex_u_max = tex_half_width;
+                    geometry_desc.tex_v_max = tex_half_height;
 
-                    if (billboard_rect_intersects_clip(&clip, xl, yl, xh, yh)) {
-                        diag_reason = 6;
-                        append_tagged_billboard_texrect(
-                            BILLBOARD_FAMILY_ENERGY,
-                            world_x,
-                            world_z,
-                            world_y,
-                            tex_half_width,
-                            tex_half_height,
-                            sprite_scale,
-                            dl,
-                            (s16)xl,
-                            (s16)yl,
-                            (s16)xh,
-                            (s16)yh,
-                            0,
-                            (s16)(-((dsdx * ((s16)yl & 3)) >> 7)),
-                            dsdx,
-                            dtdy
-                        );
-                    } else {
-                        diag_reason = 5;
-                    }
-                } else {
-                    diag_reason = 4;
+                    emit_billboard_geometry_or_fallback(
+                        &geometry_desc,
+                        dl,
+                        (s16)xl,
+                        (s16)yl,
+                        (s16)xh,
+                        (s16)yh,
+                        0,
+                        (s16)(-((dsdx * ((s16)yl & 3)) >> 7)),
+                        dsdx,
+                        dtdy
+                    );
                 }
-            } else {
-                diag_reason = 3;
             }
-        } else {
-            diag_reason = 2;
         }
-    } else {
-        diag_reason = 1;
-    }
-
-    if (diag_reason != 6) {
-        energy_diag_emit(
-            PATCH_TAG_ENERGY_SETTIMG_SEEN,
-            diag_source_bits,
-            diag_source_phys,
-            ((u32)(u16)sprite_scale << 16) | (u16)diag_reason
-        );
-        energy_diag_emit(
-            PATCH_TAG_ENERGY_RECT_EMIT,
-            ((u32)(u16)diag_screen_x << 16) | (u16)diag_screen_y,
-            ((u32)(u16)diag_xl << 16) | (u16)diag_yl,
-            ((u32)(u16)diag_xh << 16) | (u16)diag_yh
-        );
     }
 }
 
@@ -848,13 +1058,12 @@ RECOMP_PATCH void draw_collectible_billboard_texrect(Gfx **dl, s32 world_x, s32 
     u8 fog_alpha;
     s32 has_yoffset;
     BillboardScreenSpace space;
-    BillboardClipBounds clip;
     const BillboardFamilyPolicy* policy;
+    BillboardGeometryDesc geometry_desc;
 
     rc_note_texrect_context(TRC_WORLD_BILLBOARD, 0x73F800u);
     space = get_billboard_space();
     policy = get_billboard_family_policy(BILLBOARD_FAMILY_COLLECTIBLE);
-    clip = get_billboard_clip_bounds(&space, policy);
 
     has_yoffset = 0;
     if (project_billboard_to_screen(BILLBOARD_FAMILY_COLLECTIBLE, policy, world_x, world_z, world_y, &space, &projection)) {
@@ -893,27 +1102,33 @@ RECOMP_PATCH void draw_collectible_billboard_texrect(Gfx **dl, s32 world_x, s32 
                 if ((xl < xh) && (yl < yh)) {
                     dsdx = (s16)((tex_half_height << 12) / (xh - xl));
                     dtdy = (s16)((tex_half_width << 12) / (yh - yl));
+                    geometry_desc.family_id = BILLBOARD_FAMILY_COLLECTIBLE;
+                    geometry_desc.world_x = world_x;
+                    geometry_desc.world_z = world_z;
+                    geometry_desc.world_y = world_y;
+                    geometry_desc.sig0 = tex_half_width;
+                    geometry_desc.sig1 = tex_half_height | ((has_yoffset != 0) ? 0x10000 : 0);
+                    geometry_desc.sig2 = sprite_scale;
+                    geometry_desc.z_clip = projection.z_clip;
+                    geometry_desc.screen_left_x4 = xOffset;
+                    geometry_desc.screen_right_x4 = xOffset;
+                    geometry_desc.screen_down_y4 = yOffset;
+                    geometry_desc.screen_up_y4 = (has_yoffset != 0) ? (yOffset * 3.0f) : yOffset;
+                    geometry_desc.tex_u_max = tex_half_height;
+                    geometry_desc.tex_v_max = tex_half_width;
 
-                    if (billboard_rect_intersects_clip(&clip, xl, yl, xh, yh)) {
-                        append_tagged_billboard_texrect(
-                            BILLBOARD_FAMILY_COLLECTIBLE,
-                            world_x,
-                            world_z,
-                            world_y,
-                            tex_half_width,
-                            tex_half_height,
-                            sprite_scale,
-                            dl,
-                            (s16)xl,
-                            (s16)yl,
-                            (s16)xh,
-                            (s16)yh,
-                            (s16)((dsdx * ((s16)xl & 3)) >> 9),
-                            0,
-                            dsdx,
-                            dtdy
-                        );
-                    }
+                    emit_billboard_geometry_or_fallback(
+                        &geometry_desc,
+                        dl,
+                        (s16)xl,
+                        (s16)yl,
+                        (s16)xh,
+                        (s16)yh,
+                        (s16)((dsdx * ((s16)xl & 3)) >> 9),
+                        0,
+                        dsdx,
+                        dtdy
+                    );
                 }
             }
         }
@@ -930,13 +1145,12 @@ RECOMP_PATCH void draw_dualscale_billboard_texrect(Gfx **dl, s32 world_x, s32 wo
     s16 depth_scaled;
     u8 limit;
     BillboardScreenSpace space;
-    BillboardClipBounds clip;
     const BillboardFamilyPolicy* policy;
+    BillboardGeometryDesc geometry_desc;
 
     rc_note_texrect_context(TRC_WORLD_BILLBOARD, 0x740094u);
     space = get_billboard_space();
     policy = get_billboard_family_policy(BILLBOARD_FAMILY_DUALSCALE);
-    clip = get_billboard_clip_bounds(&space, policy);
     if (project_billboard_to_screen(BILLBOARD_FAMILY_DUALSCALE, policy, world_x, world_z, world_y, &space, &projection)) {
         if (projection.depth_factor > 0.0f) {
             sprite_scale_x = billboard_scale_size_by_fovy(sprite_scale_x);
@@ -987,27 +1201,33 @@ RECOMP_PATCH void draw_dualscale_billboard_texrect(Gfx **dl, s32 world_x, s32 wo
                 if ((xl < xh) && (yl < yh)) {
                     dsdx = (s16)((tex_half_height << 12) / (xh - xl));
                     dtdy = (s16)((tex_half_width << 12) / (yh - yl));
+                    geometry_desc.family_id = BILLBOARD_FAMILY_DUALSCALE;
+                    geometry_desc.world_x = world_x;
+                    geometry_desc.world_z = world_z;
+                    geometry_desc.world_y = world_y;
+                    geometry_desc.sig0 = tex_half_width;
+                    geometry_desc.sig1 = tex_half_height;
+                    geometry_desc.sig2 = (s32)(((u32)(u16)sprite_scale_x << 16) | (u16)sprite_scale_y);
+                    geometry_desc.z_clip = projection.z_clip;
+                    geometry_desc.screen_left_x4 = xOffset;
+                    geometry_desc.screen_right_x4 = xOffset;
+                    geometry_desc.screen_down_y4 = yOffset;
+                    geometry_desc.screen_up_y4 = yOffset;
+                    geometry_desc.tex_u_max = tex_half_height;
+                    geometry_desc.tex_v_max = tex_half_width;
 
-                    if (billboard_rect_intersects_clip(&clip, xl, yl, xh, yh)) {
-                        append_tagged_billboard_texrect(
-                            BILLBOARD_FAMILY_DUALSCALE,
-                            world_x,
-                            world_z,
-                            world_y,
-                            tex_half_width,
-                            tex_half_height,
-                            (s32)(((u32)(u16)sprite_scale_x << 16) | (u16)sprite_scale_y),
-                            dl,
-                            (s16)xl,
-                            (s16)yl,
-                            (s16)xh,
-                            (s16)yh,
-                            (s16)((dsdx * ((s16)xl & 3)) >> 9),
-                            (s16)(-(dtdy * ((s16)yl & 3)) >> 7),
-                            dsdx,
-                            dtdy
-                        );
-                    }
+                    emit_billboard_geometry_or_fallback(
+                        &geometry_desc,
+                        dl,
+                        (s16)xl,
+                        (s16)yl,
+                        (s16)xh,
+                        (s16)yh,
+                        (s16)((dsdx * ((s16)xl & 3)) >> 9),
+                        (s16)(-(dtdy * ((s16)yl & 3)) >> 7),
+                        dsdx,
+                        dtdy
+                    );
                 }
             }
         }
@@ -1085,14 +1305,7 @@ RECOMP_PATCH void draw_particle_billboard_texrect(Gfx **dl, s32 world_x, s32 wor
                     dtdy = (s16)((tex_half_width << 12) / (yh - yl));
 
                     if (billboard_rect_intersects_clip(&clip, xl, yl, xh, yh)) {
-                        append_tagged_billboard_texrect(
-                            BILLBOARD_FAMILY_PARTICLE,
-                            world_x,
-                            world_z,
-                            world_y,
-                            tex_half_width,
-                            tex_half_height,
-                            (s32)(((u32)(u16)sprite_scale_x << 16) | (u16)sprite_scale_y),
+                        append_legacy_billboard_texrect(
                             dl,
                             (s16)xl,
                             (s16)yl,
@@ -1108,6 +1321,130 @@ RECOMP_PATCH void draw_particle_billboard_texrect(Gfx **dl, s32 world_x, s32 wor
             }
         }
     }
+}
+
+RECOMP_PATCH void render_dynamic_texture_billboards_6AE758(void) {
+    u8 loaded_texture;
+    u8 loaded_texture_2;
+    s8 i;
+    u8 r;
+    u8 g;
+    u8 b;
+    DynamicTextureMinimal* tex;
+    static s32 s_collectible_anim_counter;
+    static s32 s_collectible_anim_step;
+
+    loaded_texture = 0xFF;
+    loaded_texture_2 = 0xFF;
+
+    s_energy_anim_phase += 1;
+    s_energy_anim_phase &= (s16)ENERGY_ANIM_PHASE_MASK;
+
+    if ((guRandom() % 20) == 1) {
+        if (s_collectible_anim_step == 5) {
+            s_collectible_anim_step = 1;
+        } else {
+            s_collectible_anim_step = 5;
+        }
+    }
+
+    s_collectible_anim_counter += s_collectible_anim_step;
+    s_collectible_anim_counter %= 9;
+
+    gSPDisplayList(gLayer0DL++, D_01004308_3DBD8);
+    gSPDisplayList(gAuxDL++, D_01004B98_3E468);
+
+    for (i = 0; i != -1; i = D_803D2E08.textures[i].next) {
+        tex = &D_803D2E08.textures[i];
+
+        if (tex->category < 32) {
+            if (tex->category != loaded_texture) {
+                if (loaded_texture != 0xFF) {
+                    D_803D2E08.textureGroups[loaded_texture] = -1;
+                }
+                loaded_texture = tex->category;
+                if (loaded_texture == 0) {
+                    func_8029D8D8_6AEF88(&gAuxDL, loaded_texture + (s_collectible_anim_counter / 3));
+                } else {
+                    func_8029D8D8_6AEF88(&gAuxDL, loaded_texture);
+                }
+            }
+
+            billboard_signature_override_begin(
+                tex->category,
+                ((s32)(u8)tex->unk10 << 16) | (u16)(s_collectible_anim_counter / 3),
+                tex->size
+            );
+            if (tex->unk10 == 127) {
+                draw_collectible_billboard_texrect(&gAuxDL, tex->xPos, tex->zPos, tex->yPos, 31, 63, tex->size * 3);
+            } else {
+                draw_collectible_billboard_texrect(&gAuxDL, tex->xPos, tex->zPos, tex->yPos, 31, 31, tex->size * 3);
+            }
+            billboard_signature_override_end();
+            gDPPipeSync(gAuxDL++);
+        } else {
+            r = tex->red;
+            g = tex->green;
+            b = tex->blue;
+
+            if (tex->category < 48) {
+                gDPSetPrimColor(gLayer0DL++, 0, 0, r, g, b, 0xFF);
+                gDPSetEnvColor(gLayer0DL++, r, g, b, 0);
+            }
+            if (tex->category != loaded_texture_2) {
+                if (loaded_texture_2 != 0xFF) {
+                    D_803D2E08.textureGroups[loaded_texture_2] = -1;
+                }
+                loaded_texture_2 = tex->category;
+                if (loaded_texture_2 < 48) {
+                    gDPSetCombineLERP(
+                        gLayer0DL++,
+                        PRIMITIVE, ENVIRONMENT, TEXEL0, ENVIRONMENT,
+                        PRIMITIVE, ENVIRONMENT, TEXEL0, ENVIRONMENT,
+                        0, 0, 0, COMBINED,
+                        0, 0, 0, COMBINED
+                    );
+
+                    gDPSetTextureImage(gLayer0DL++, G_IM_FMT_I, G_IM_SIZ_16b, 1, OS_PHYSICAL_TO_K0(D_01029E10_636E0 + ((loaded_texture_2 << 10) - 0x8000)));
+                    gDPSetTile(gLayer0DL++, G_IM_FMT_I, G_IM_SIZ_16b, 0, 0x0000, G_TX_LOADTILE, 0, G_TX_NOMIRROR | G_TX_WRAP, 5, G_TX_NOLOD, G_TX_NOMIRROR | G_TX_WRAP, 5, G_TX_NOLOD);
+                    gDPLoadSync(gLayer0DL++);
+                    gDPLoadBlock(gLayer0DL++, G_TX_LOADTILE, 0, 0, 511, 512);
+                    gDPPipeSync(gLayer0DL++);
+                    gDPSetTile(gLayer0DL++, G_IM_FMT_I, G_IM_SIZ_8b, 4, 0x0000, G_TX_RENDERTILE, 0, G_TX_NOMIRROR | G_TX_WRAP, 5, G_TX_NOLOD, G_TX_NOMIRROR | G_TX_WRAP, 5, G_TX_NOLOD);
+                    gDPSetTileSize(gLayer0DL++, G_TX_RENDERTILE, 0, 0, BILLBOARD_TILE_COORD_MAX_32X32, BILLBOARD_TILE_COORD_MAX_32X32);
+                } else if (loaded_texture_2 == 48) {
+                    setup_energy_billboard_material(&gLayer0DL, energy_frame_index());
+                }
+            }
+            if (loaded_texture_2 == 0x30) {
+                if (tex->unk10 == 60) {
+                    gDPSetPrimColor(gLayer0DL++, 0, 0, 255, 255, 255, 255);
+                }
+                if (tex->unk10 == 59) {
+                    gDPSetPrimColor(gLayer0DL++, 0, 0, 255, 160, 255, 255);
+                }
+                if (tex->unk10 == 58) {
+                    gDPSetPrimColor(gLayer0DL++, 0, 0, 255, 0, 255, 255);
+                }
+            }
+
+            gDPSetDepthSource(gLayer0DL++, G_ZS_PRIM);
+            gDPSetRenderMode(gLayer0DL++, G_RM_PASS, G_RM_AA_ZB_XLU_SURF2);
+
+            billboard_signature_override_begin(
+                tex->category,
+                ((s32)(u8)tex->unk10 << 24) | ((s32)tex->red << 16) | ((s32)tex->green << 8) | tex->blue,
+                (loaded_texture_2 == 48) ? energy_frame_index() : tex->size
+            );
+            draw_energy_billboard_texrect(&gLayer0DL, tex->xPos, tex->zPos, tex->yPos, 0x1F, 0x1F, tex->size * 3);
+            billboard_signature_override_end();
+            gDPPipeSync(gLayer0DL++);
+        }
+    }
+
+    billboard_signature_override_end();
+    D_803D2E08.unk0 = -1;
+    D_803D2E08.unk1 = -1;
 }
 
 RECOMP_PATCH s16 classify_visibility_and_draw_fov_mask(

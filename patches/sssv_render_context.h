@@ -56,6 +56,7 @@ void rc_set_projection_ids_for_context(RenderContext ctx);
 u32 rc_next_hud_transform_id(void);
 u32 rc_next_overlay_transform_id(void);
 u32 rc_next_world_mask_transform_id(void);
+u32 rc_alloc_billboard_transform_id(RcBillboardFamily family);
 
 void rc_update_camera_cut_skip(void);
 void rc_ensure_rt64_extended_enabled(Gfx** dl);

@@ -31,14 +31,38 @@ typedef union {
     u64 force_structure_alignment;
 } Mtx;
 
+typedef struct {
+    s16 ob[3];
+    u16 flag;
+    s16 tc[2];
+    u8 cn[4];
+} Vtx_t;
+
+typedef struct {
+    s16 ob[3];
+    u16 flag;
+    s16 tc[2];
+    s8 n[3];
+    u8 a;
+} Vtx_tn;
+
+typedef union {
+    Vtx_t v;
+    Vtx_tn n;
+    u64 force_structure_alignment[2];
+} Vtx;
+
 // F3DEX command constants used by current patches.
 #define G_MTX 0x01u
 #define G_MOVEMEM 0x03u
+#define G_VTX 0x04u
 #define G_MOVEWORD 0xBCu
 #define G_DL 0x06u
 #define G_SPRITE2D_BASE 0x09u
 #define G_SPRITE2D_SCALEFLIP 0xBEu
 #define G_SPRITE2D_DRAW 0xBDu
+#define G_TEXTURE 0xBBu
+#define G_TRI1 0xBFu
 #define G_MW_PERSPNORM 0x0Eu
 #define G_MW_SEGMENT 0x06u
 
@@ -86,6 +110,7 @@ typedef union {
 #define G_SC_NON_INTERLACE 0u
 
 #define G_AC_NONE 0u
+#define G_AC_THRESHOLD 1u
 
 #define G_IM_FMT_RGBA 0u
 #define G_IM_FMT_YUV 1u
@@ -108,6 +133,7 @@ typedef union {
 #define G_TX_NOLOD 0u
 
 #define G_CYC_1CYCLE 0x00000000u
+#define G_CYC_2CYCLE 0x00100000u
 #define G_CYC_FILL 0x00300000u
 
 #define G_CD_NOISE 0x00000080u
@@ -116,16 +142,50 @@ typedef union {
 // Render mode constants already expanded for gDPSetRenderMode below.
 #define G_RM_NOOP 0x00000000u
 #define G_RM_NOOP2 0x00000000u
-#define G_RM_OPA_SURF G_RM_NOOP
-#define G_RM_OPA_SURF2 G_RM_NOOP2
+#define G_RM_OPA_SURF 0x0C084000u
+#define G_RM_OPA_SURF2 0x00302400u
 #define G_RM_AA_XLU_SURF 0x005041C8u
-#define G_RM_AA_XLU_SURF2 0x00000000u
+#define G_RM_AA_XLU_SURF2 0x001041C8u
 #define G_RM_XLU_SURF 0x00504240u
-#define G_RM_XLU_SURF2 0x00000000u
+#define G_RM_XLU_SURF2 0x00104240u
+#define G_RM_AA_ZB_XLU_SURF2 0x001049D8u
+#define G_RM_AA_ZB_OPA_SURF2 0x00112078u
+#define G_RM_AA_ZB_TEX_EDGE2 0x00113078u
+#define G_RM_PASS 0x0C080000u
 
-#define G_CC_PRIMITIVE 0u
+#define G_ZS_PIXEL 0x00000000u
+#define G_ZS_PRIM 0x00000004u
+
+#define G_CCMUX_COMBINED 0u
+#define G_CCMUX_TEXEL0 1u
+#define G_CCMUX_TEXEL1 2u
+#define G_CCMUX_PRIMITIVE 3u
+#define G_CCMUX_SHADE 4u
+#define G_CCMUX_ENVIRONMENT 5u
+#define G_CCMUX_PRIM_LOD_FRAC 14u
+#define G_CCMUX_0 31u
+
+#define G_ACMUX_COMBINED 0u
+#define G_ACMUX_TEXEL0 1u
+#define G_ACMUX_TEXEL1 2u
+#define G_ACMUX_PRIMITIVE 3u
+#define G_ACMUX_SHADE 4u
+#define G_ACMUX_ENVIRONMENT 5u
+#define G_ACMUX_0 7u
+
+#define G_CC_PRIMITIVE 0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE
+#define G_CC_MODULATEI TEXEL0, 0, SHADE, 0, 0, 0, 0, SHADE
+#define G_CC_PASS2 0, 0, 0, COMBINED, 0, 0, 0, COMBINED
+#define G_CC_BLENDPE PRIMITIVE, ENVIRONMENT, TEXEL0, ENVIRONMENT, TEXEL0, 0, SHADE, 0
+#define G_CC_BLENDPEDECALA PRIMITIVE, ENVIRONMENT, TEXEL0, ENVIRONMENT, 0, 0, 0, TEXEL0
 
 #define G_TP_NONE 0u
+#define G_TP_PERSP 0x00080000u
+
+#define G_TL_TILE 0u
+#define G_TT_NONE 0u
+#define G_ON 1u
+#define G_OFF 0u
 
 #define GPACK_RGBA5551(r, g, b, a) \
     ((((u32)(r) << 8) & 0xF800u) | (((u32)(g) << 3) & 0x07C0u) | (((u32)(b) >> 2) & 0x003Eu) | ((u32)(a) & 0x1u))
@@ -136,6 +196,24 @@ static inline u32 gpack_texrect_xy(int x, int y) {
 
 static inline u32 gpack_scissor_xy(int x, int y) {
     return ((u32)(x & 0x0FFF) << 12) | ((u32)(y & 0x0FFF));
+}
+
+static inline u32 gdp_safe_image_width(u32 width) {
+    return (width == 0u) ? 1u : width;
+}
+
+static inline u32 gdp_image_cmd_w0(u32 cmd, u32 fmt, u32 siz, u32 width) {
+    return _SHIFTL(cmd, 24, 8) | _SHIFTL(fmt, 21, 3) | _SHIFTL(siz, 19, 2) | _SHIFTL(gdp_safe_image_width(width) - 1u, 0, 12);
+}
+
+static inline u32 gdp_tile_cmd_w0(u32 cmd, u32 uls, u32 ult) {
+    return _SHIFTL(cmd, 24, 8) | _SHIFTL(uls, 12, 12) | _SHIFTL(ult, 0, 12);
+}
+
+// LOADBLOCK, LOADTILE, and SETTILESIZE all encode the tile selector in w1.
+// RT64 decodes the same layout, so keep these builders aligned with the RDP bitfields.
+static inline u32 gdp_tile_cmd_w1(u32 tile, u32 param0, u32 param1) {
+    return _SHIFTL(tile, 24, 3) | _SHIFTL(param0, 12, 12) | _SHIFTL(param1, 0, 12);
 }
 
 static inline void gImmp1_(Gfx* pkt, u32 cmd, u32 param) {
@@ -200,11 +278,9 @@ static inline void gDPSetPrimColor_(Gfx* pkt, u32 m, u32 l, u32 r, u32 g, u32 b,
     pkt->words.w1 = _SHIFTL(r, 24, 8) | _SHIFTL(g, 16, 8) | _SHIFTL(b, 8, 8) | _SHIFTL(a, 0, 8);
 }
 
-static inline void gDPSetCombineMode_(Gfx* pkt, u32 a, u32 b) {
-    (void)a;
-    (void)b;
-    pkt->words.w0 = 0xFCFFFFFFu;
-    pkt->words.w1 = 0xFFFDF6FBu;
+static inline void gDPSetCombine_(Gfx* pkt, u32 muxs0, u32 muxs1) {
+    pkt->words.w0 = _SHIFTL(G_SETCOMBINE, 24, 8) | _SHIFTL(muxs0, 0, 24);
+    pkt->words.w1 = muxs1;
 }
 
 static inline void gDPSetTexturePersp_(Gfx* pkt, u32 mode) {
@@ -222,9 +298,13 @@ static inline void gDPSetPrimDepth_(Gfx* pkt, s32 z, s32 dz) {
     pkt->words.w1 = _SHIFTL((u32)z, 16, 16) | _SHIFTL((u32)dz, 0, 16);
 }
 
+static inline void gDPSetDepthSource_(Gfx* pkt, u32 src) {
+    pkt->words.w0 = 0xB9000201u;
+    pkt->words.w1 = src;
+}
+
 static inline void gDPSetTextureImage_(Gfx* pkt, u32 fmt, u32 siz, u32 width, const void* img) {
-    u32 safe_width = (width == 0u) ? 1u : width;
-    pkt->words.w0 = _SHIFTL(G_SETTIMG, 24, 8) | _SHIFTL(fmt, 21, 3) | _SHIFTL(siz, 19, 2) | _SHIFTL(safe_width - 1u, 0, 12);
+    pkt->words.w0 = gdp_image_cmd_w0(G_SETTIMG, fmt, siz, width);
     pkt->words.w1 = (u32)(uintptr_t)img;
 }
 
@@ -240,23 +320,50 @@ static inline void gDPLoadSync_(Gfx* pkt) {
 }
 
 static inline void gDPLoadBlock_(Gfx* pkt, u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt) {
-    pkt->words.w0 = _SHIFTL(G_LOADBLOCK, 24, 8) | _SHIFTL(tile, 24, 3) | _SHIFTL(uls, 12, 12) | _SHIFTL(ult, 0, 12);
-    pkt->words.w1 = _SHIFTL(lrs, 12, 12) | _SHIFTL(dxt, 0, 12);
+    pkt->words.w0 = gdp_tile_cmd_w0(G_LOADBLOCK, uls, ult);
+    pkt->words.w1 = gdp_tile_cmd_w1(tile, lrs, dxt);
 }
 
 static inline void gDPLoadTile_(Gfx* pkt, u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt) {
-    pkt->words.w0 = _SHIFTL(G_LOADTILE, 24, 8) | _SHIFTL(tile, 24, 3) | _SHIFTL(uls, 12, 12) | _SHIFTL(ult, 0, 12);
-    pkt->words.w1 = _SHIFTL(lrs, 12, 12) | _SHIFTL(lrt, 0, 12);
+    pkt->words.w0 = gdp_tile_cmd_w0(G_LOADTILE, uls, ult);
+    pkt->words.w1 = gdp_tile_cmd_w1(tile, lrs, lrt);
 }
 
 static inline void gDPSetTileSize_(Gfx* pkt, u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt) {
-    pkt->words.w0 = _SHIFTL(G_SETTILESIZE, 24, 8) | _SHIFTL(tile, 24, 3) | _SHIFTL(uls, 12, 12) | _SHIFTL(ult, 0, 12);
-    pkt->words.w1 = _SHIFTL(lrs, 12, 12) | _SHIFTL(lrt, 0, 12);
+    pkt->words.w0 = gdp_tile_cmd_w0(G_SETTILESIZE, uls, ult);
+    pkt->words.w1 = gdp_tile_cmd_w1(tile, lrs, lrt);
 }
 
 static inline void gSPDisplayList_(Gfx* pkt, const void* dl) {
     pkt->words.w0 = _SHIFTL(G_DL, 24, 8);
     pkt->words.w1 = (u32)(uintptr_t)dl;
+}
+
+static inline void gSPTexture_(Gfx* pkt, u32 s, u32 t, u32 level, u32 tile, u32 on) {
+    pkt->words.w0 = _SHIFTL(G_TEXTURE, 24, 8) | _SHIFTL(level, 11, 3) | _SHIFTL(tile, 8, 3) | _SHIFTL(on, 0, 8);
+    pkt->words.w1 = _SHIFTL(s, 16, 16) | _SHIFTL(t, 0, 16);
+}
+
+static inline void gSPVertex_(Gfx* pkt, const Vtx* v, u32 n, u32 v0) {
+    pkt->words.w0 = _SHIFTL(G_VTX, 24, 8) | _SHIFTL(v0 * 2u, 16, 8) | _SHIFTL((n << 10) | ((sizeof(Vtx) * n) - 1u), 0, 16);
+    pkt->words.w1 = (u32)(uintptr_t)v;
+}
+
+static inline void gSP1Triangle_(Gfx* pkt, u32 v0, u32 v1, u32 v2, u32 flag) {
+    if (flag == 1u) {
+        u32 tmp0 = v0;
+        v0 = v1;
+        v1 = v2;
+        v2 = tmp0;
+    } else if (flag != 0u) {
+        u32 tmp0 = v0;
+        v0 = v2;
+        v2 = v1;
+        v1 = tmp0;
+    }
+
+    pkt->words.w0 = _SHIFTL(G_TRI1, 24, 8);
+    pkt->words.w1 = _SHIFTL(v0 * 2u, 16, 8) | _SHIFTL(v1 * 2u, 8, 8) | _SHIFTL(v2 * 2u, 0, 8);
 }
 
 static inline void gSPSprite2DBase_(Gfx* pkt, u32 sprite) {
@@ -275,8 +382,7 @@ static inline void gSPSprite2DDraw_(Gfx* pkt, u32 px, u32 py) {
 }
 
 static inline void gDPSetColorImage_(Gfx* pkt, u32 fmt, u32 siz, u32 width, const void* img) {
-    u32 safe_width = (width == 0u) ? 1u : width;
-    pkt->words.w0 = _SHIFTL(G_SETCIMG, 24, 8) | _SHIFTL(fmt, 21, 3) | _SHIFTL(siz, 19, 2) | _SHIFTL(safe_width - 1u, 0, 12);
+    pkt->words.w0 = gdp_image_cmd_w0(G_SETCIMG, fmt, siz, width);
     pkt->words.w1 = (u32)(uintptr_t)img;
 }
 
@@ -335,10 +441,10 @@ static inline void gSPScisTextureRectangle_(
 #define gDPFillRectangle(pkt, ulx, uly, lrx, lry) gDPFillRectangle_(pkt, ulx, uly, lrx, lry)
 #define gDPScisFillRectangle(pkt, ulx, uly, lrx, lry) gDPScisFillRectangle_(pkt, ulx, uly, lrx, lry)
 #define gDPSetPrimColor(pkt, m, l, r, g, b, a) gDPSetPrimColor_(pkt, m, l, r, g, b, a)
-#define gDPSetCombineMode(pkt, a, b) gDPSetCombineMode_(pkt, a, b)
 #define gDPSetTexturePersp(pkt, mode) gDPSetTexturePersp_(pkt, mode)
 #define gDPSetEnvColor(pkt, r, g, b, a) gDPSetEnvColor_(pkt, r, g, b, a)
 #define gDPSetPrimDepth(pkt, z, dz) gDPSetPrimDepth_(pkt, z, dz)
+#define gDPSetDepthSource(pkt, src) gDPSetDepthSource_(pkt, src)
 #define gDPSetTextureImage(pkt, fmt, siz, width, img) gDPSetTextureImage_(pkt, fmt, siz, width, img)
 #define gDPSetTile(pkt, fmt, siz, line, tmem, tile, palette, cmt, maskt, shiftt, cms, masks, shifts) gDPSetTile_(pkt, fmt, siz, line, tmem, tile, palette, cmt, maskt, shiftt, cms, masks, shifts)
 #define gDPLoadSync(pkt) gDPLoadSync_(pkt)
@@ -346,6 +452,9 @@ static inline void gSPScisTextureRectangle_(
 #define gDPLoadTile(pkt, tile, uls, ult, lrs, lrt) gDPLoadTile_(pkt, tile, uls, ult, lrs, lrt)
 #define gDPSetTileSize(pkt, tile, uls, ult, lrs, lrt) gDPSetTileSize_(pkt, tile, uls, ult, lrs, lrt)
 #define gSPDisplayList(pkt, dl) gSPDisplayList_(pkt, dl)
+#define gSPTexture(pkt, s, t, level, tile, on) gSPTexture_(pkt, s, t, level, tile, on)
+#define gSPVertex(pkt, v, n, v0) gSPVertex_(pkt, v, n, v0)
+#define gSP1Triangle(pkt, v0, v1, v2, flag) gSP1Triangle_(pkt, v0, v1, v2, flag)
 #define gSPSprite2DBase(pkt, s) gSPSprite2DBase_(pkt, s)
 #define gSPSprite2DScaleFlip(pkt, sx, sy, fx, fy) gSPSprite2DScaleFlip_(pkt, (u32)(sx), (u32)(sy), (u32)(fx), (u32)(fy))
 #define gSPSprite2DDraw(pkt, px, py) gSPSprite2DDraw_(pkt, (u32)(px), (u32)(py))
@@ -379,6 +488,23 @@ static inline void gSPSegment(Gfx* pkt, u32 seg, const void* base) {
     pkt->words.w1 = (u32)(uintptr_t)base;
 }
 
+#define GCCc0w0(saRGB0, mRGB0, saA0, mA0) \
+    (_SHIFTL((saRGB0), 20, 4) | _SHIFTL((mRGB0), 15, 5) | _SHIFTL((saA0), 12, 3) | _SHIFTL((mA0), 9, 3))
+#define GCCc1w0(saRGB1, mRGB1) \
+    (_SHIFTL((saRGB1), 5, 4) | _SHIFTL((mRGB1), 0, 5))
+#define GCCc0w1(sbRGB0, aRGB0, sbA0, aA0) \
+    (_SHIFTL((sbRGB0), 28, 4) | _SHIFTL((aRGB0), 15, 3) | _SHIFTL((sbA0), 12, 3) | _SHIFTL((aA0), 9, 3))
+#define GCCc1w1(sbRGB1, saA1, mA1, aRGB1, sbA1, aA1) \
+    (_SHIFTL((sbRGB1), 24, 4) | _SHIFTL((saA1), 21, 3) | _SHIFTL((mA1), 18, 3) | _SHIFTL((aRGB1), 6, 3) | _SHIFTL((sbA1), 3, 3) | _SHIFTL((aA1), 0, 3))
+
+#define gDPSetCombineLERP(pkt, a0, b0, c0, d0, Aa0, Ab0, Ac0, Ad0, a1, b1, c1, d1, Aa1, Ab1, Ac1, Ad1) \
+    gDPSetCombine_(                                                                                                                             \
+        (pkt),                                                                                                                                  \
+        GCCc0w0(G_CCMUX_##a0, G_CCMUX_##c0, G_ACMUX_##Aa0, G_ACMUX_##Ac0) | GCCc1w0(G_CCMUX_##a1, G_CCMUX_##c1),                              \
+        GCCc0w1(G_CCMUX_##b0, G_CCMUX_##d0, G_ACMUX_##Ab0, G_ACMUX_##Ad0) |                                                                     \
+            GCCc1w1(G_CCMUX_##b1, G_ACMUX_##Aa1, G_ACMUX_##Ac1, G_CCMUX_##d1, G_ACMUX_##Ab1, G_ACMUX_##Ad1))
+#define gDPSetCombineMode(pkt, a, b) gDPSetCombineLERP(pkt, a, b)
+
 void guPerspective(Mtx* m, u16* perspNorm, f32 fovy, f32 aspect, f32 near, f32 far, f32 scale);
 void guScale(Mtx* m, f32 x, f32 y, f32 z);
 void guTranslate(Mtx* m, f32 x, f32 y, f32 z);
@@ -390,6 +516,7 @@ void osViSetYScale(f32 scale);
 u32 osVirtualToPhysical(const void* vaddr);
 
 #define OS_K0_TO_PHYSICAL(x) (u32)(((char*)(x) - 0x80000000))
+#define OS_PHYSICAL_TO_K0(x) ((void*)(((u32)(x)) + 0x80000000u))
 
 #define gSPPopMatrix(pkt, mode) gSPPopMatrix_(pkt, mode)
 

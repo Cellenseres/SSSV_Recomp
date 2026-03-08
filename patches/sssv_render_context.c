@@ -15,7 +15,7 @@ RECOMP_EXPORT u32 sssv_patch_feature_flags =
     FEATURE_RT64_TAGGING |
     FEATURE_CAMERA_CUT_SKIP;
 
-RECOMP_EXPORT u32 sssv_patch_diag_flags = SSSV_DIAG_WARN;
+RECOMP_EXPORT u32 sssv_patch_diag_flags = 0;
 
 s32 cur_perspective_projection_transform_id = 0;
 s32 cur_ortho_projection_transform_id = 0;
@@ -29,6 +29,11 @@ static s32 g_rc_stack_top = -1;
 static u32 g_hud_counter = 0;
 static u32 g_overlay_counter = 0;
 static u32 g_world_mask_counter = 0;
+static u32 g_billboard_star_counter = 0;
+static u32 g_billboard_energy_counter = 0;
+static u32 g_billboard_collectible_counter = 0;
+static u32 g_billboard_dualscale_counter = 0;
+static u32 g_billboard_particle_counter = 0;
 static u32 g_rt64_extended_slot_mask = 0;
 static s32 g_rt64_extended_unknown_enabled = 0;
 static Gfx** g_rt64_extended_unknown_dl_slot = NULL;
@@ -204,6 +209,24 @@ u32 rc_next_overlay_transform_id(void) {
 
 u32 rc_next_world_mask_transform_id(void) {
     return next_id_in_bucket(SSSV_WORLD_MASK_ID_START, &g_world_mask_counter);
+}
+
+u32 rc_alloc_billboard_transform_id(RcBillboardFamily family) {
+    switch (family) {
+        case RC_BILLBOARD_FAMILY_STAR:
+            return next_id_in_bucket(SSSV_BILLBOARD_STAR_ID_START, &g_billboard_star_counter);
+        case RC_BILLBOARD_FAMILY_ENERGY:
+            return next_id_in_bucket(SSSV_BILLBOARD_ENERGY_ID_START, &g_billboard_energy_counter);
+        case RC_BILLBOARD_FAMILY_COLLECTIBLE:
+            return next_id_in_bucket(SSSV_BILLBOARD_COLLECTIBLE_ID_START, &g_billboard_collectible_counter);
+        case RC_BILLBOARD_FAMILY_DUALSCALE:
+            return next_id_in_bucket(SSSV_BILLBOARD_DUALSCALE_ID_START, &g_billboard_dualscale_counter);
+        case RC_BILLBOARD_FAMILY_PARTICLE:
+            return next_id_in_bucket(SSSV_BILLBOARD_PARTICLE_ID_START, &g_billboard_particle_counter);
+        default:
+            PATCH_TRACE_DIAG(SSSV_DIAG_WARN, PATCH_TAG_ID_COLLISION, RC_ERR_INVALID_CTX, (u32)family, 0);
+            return next_id_in_bucket(SSSV_BILLBOARD_PARTICLE_ID_START, &g_billboard_particle_counter);
+    }
 }
 
 void rc_update_camera_cut_skip(void) {
