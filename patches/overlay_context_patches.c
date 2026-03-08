@@ -20,9 +20,9 @@
 #define SFX_UNKNOWN_135_PATCH 135
 #define TERMINAL_SCENE_DL_OFFSET 0x9600u
 
-#define SIN_PATCH(x) D_80152C78[((s16)(x)) & 0xFF]
-#define COS_PATCH(x) D_80152C78[(((s16)(x)) + 0x40) & 0xFF]
-#define SSSV_RAND_PATCH(x) (func_8012826C() & ((x) - 1))
+#define SIN_PATCH(x) gSineTable256[((s16)(x)) & 0xFF]
+#define COS_PATCH(x) gSineTable256[(((s16)(x)) + 0x40) & 0xFF]
+#define SSSV_RAND_PATCH(x) (advance_random_seed() & ((x) - 1))
 
 static inline void patch_write_main_viewport_expand(s16 viewport_width, s16 viewport_height) {
     gMainViewport.vscale[0] = (s16)(viewport_width * 2);
@@ -162,7 +162,7 @@ RECOMP_PATCH void setup_pause_menu_perspective_b_7A6F04(void) {
     rt64_tag_projection_matrix(&gMainDL, (u32)cur_perspective_projection_transform_id);
 }
 
-RECOMP_PATCH void func_8038DA70_79F120(void) {
+RECOMP_PATCH void render_terminal_background_scene(void) {
     const s16 target_vp_h = get_safe_screen_height();
     const s16 target_vp_w = compute_target_width_for_height_patch(target_vp_h);
     s32 scissor_ulx, scissor_uly, scissor_lrx, scissor_lry;
@@ -254,7 +254,7 @@ RECOMP_PATCH void render_terminal_background_dna_79FBB4(u16 arg0) {
     spin_dna_helixes(arg0);
 }
 
-RECOMP_PATCH void func_8038DBE0_79F290(s32 arg0, s32 arg1) {
+RECOMP_PATCH void render_terminal_stat_text(s32 arg0, s32 arg1) {
     s16 leading_chars;
     s16 value_chars;
     s16 i;
@@ -355,7 +355,7 @@ RECOMP_PATCH void func_8038DBE0_79F290(s32 arg0, s32 arg1) {
     rc_pop();
 }
 
-RECOMP_PATCH void func_8038E9F8_7A00A8(void) {
+RECOMP_PATCH void render_terminal_background_frame(void) {
     s32 scissor_ulx, scissor_uly, scissor_lrx, scissor_lry;
     s32 transition_mask;
     s16 i;
@@ -389,7 +389,7 @@ RECOMP_PATCH void func_8038E9F8_7A00A8(void) {
     patch_gDPSetFogColor(gMainDL++, 0x00, 0x00, 0x00, 0x00);
 
     if (gTerminalFadeStep == 0) {
-        func_8013385C(1.0f, 0.0f, 20.0f);
+        start_sfx_volume_fade(1.0f, 0.0f, 20.0f);
         D_803F6470 = 0;
         D_803F646C = 0.0f;
         if (D_80291090.hasRumblePak[0] != 0) {
@@ -440,8 +440,8 @@ RECOMP_PATCH void func_8038E9F8_7A00A8(void) {
             if (gScreenWidth < SSSV_BASE_WIDTH) {
                 gScreenWidth += 2;
             }
-            func_8038D920_79EFD0(0xFF);
-            func_8038DA70_79F120();
+            update_terminal_scene_lighting(0xFF);
+            render_terminal_background_scene();
 
             if (gTerminalFrameCounter++ > 40) {
                 gTerminalTransitionCounter = 1;
@@ -459,7 +459,7 @@ RECOMP_PATCH void func_8038E9F8_7A00A8(void) {
             patch_clear_overlay_color(&gMainDL);
             set_menu_text_color(0xFF, 0xFF, 0xFF, 0xFF);
             select_font(0, FONT_COMIC_SANS_PATCH, 1, 0);
-            func_8038D920_79EFD0(0xFF);
+            update_terminal_scene_lighting(0xFF);
 
             random_offset = SSSV_RAND_PATCH(8);
             for (i = 0; i < 6; i++) {
@@ -490,14 +490,14 @@ RECOMP_PATCH void func_8038E9F8_7A00A8(void) {
             );
             patch_apply_safe_scissor(&gMainDL);
 
-            func_8038D004_79E6B4(&gLayer0DL, gTerminalFrameCounter);
-            func_8038DA70_79F120();
+            render_terminal_background_glyphs(&gLayer0DL, gTerminalFrameCounter);
+            render_terminal_background_scene();
             render_terminal_background_dna_79FBB4(gTerminalFrameCounter);
             load_default_display_list(&gMainDL);
             set_menu_text_color(0x80, 0xFF, 0x00, 0xFF);
             select_font(0, FONT_COMIC_SANS_PATCH, 1, 0);
             rc_ensure_rt64_extended_enabled(&gMainDL);
-            func_8038DBE0_79F290(0xE, 0x10);
+            render_terminal_stat_text(0xE, 0x10);
 
             if (gTerminalFrameCounter++ > 65000) {
                 gTerminalFrameCounter = 200;
@@ -505,7 +505,7 @@ RECOMP_PATCH void func_8038E9F8_7A00A8(void) {
 
             if (((gControllerInput->button & CONT_A) != 0) || ((gControllerInput->button & CONT_B) != 0)) {
                 if (gTerminalTransitionCounter == 0) {
-                    func_801337DC(0, 25.0f, 0.0f, 20.0f);
+                    start_sequence_volume_fade(0, 25.0f, 0.0f, 20.0f);
                     gTerminalFadeStep = 0;
                     gTerminalTransitionCounter = 1;
                     gTerminalFrameCounter = 0;
@@ -530,8 +530,8 @@ RECOMP_PATCH void func_8038E9F8_7A00A8(void) {
         }
 
         case 2:
-            func_8038D920_79EFD0(0xFF);
-            func_8038DA70_79F120();
+            update_terminal_scene_lighting(0xFF);
+            render_terminal_background_scene();
             if (gTerminalFrameCounter == 1) {
                 func_802F2EEC_70459C(80, 80, 80, 200, 200, 200, 10);
             }
