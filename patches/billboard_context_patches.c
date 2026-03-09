@@ -1354,19 +1354,19 @@ RECOMP_PATCH void render_dynamic_texture_billboards_6AE758(void) {
     gSPDisplayList(gLayer0DL++, D_01004308_3DBD8);
     gSPDisplayList(gAuxDL++, D_01004B98_3E468);
 
-    for (i = 0; i != -1; i = D_803D2E08.textures[i].next) {
-        tex = &D_803D2E08.textures[i];
+    for (i = 0; i != -1; i = gDynamicTextureBillboardQueue.textures[i].next) {
+        tex = &gDynamicTextureBillboardQueue.textures[i];
 
         if (tex->category < 32) {
             if (tex->category != loaded_texture) {
                 if (loaded_texture != 0xFF) {
-                    D_803D2E08.textureGroups[loaded_texture] = -1;
+                    gDynamicTextureBillboardQueue.textureGroups[loaded_texture] = -1;
                 }
                 loaded_texture = tex->category;
                 if (loaded_texture == 0) {
-                    func_8029D8D8_6AEF88(&gAuxDL, loaded_texture + (s_collectible_anim_counter / 3));
+                    load_dynamic_texture_billboard_texture_pair(&gAuxDL, loaded_texture + (s_collectible_anim_counter / 3));
                 } else {
-                    func_8029D8D8_6AEF88(&gAuxDL, loaded_texture);
+                    load_dynamic_texture_billboard_texture_pair(&gAuxDL, loaded_texture);
                 }
             }
 
@@ -1393,7 +1393,7 @@ RECOMP_PATCH void render_dynamic_texture_billboards_6AE758(void) {
             }
             if (tex->category != loaded_texture_2) {
                 if (loaded_texture_2 != 0xFF) {
-                    D_803D2E08.textureGroups[loaded_texture_2] = -1;
+                    gDynamicTextureBillboardQueue.textureGroups[loaded_texture_2] = -1;
                 }
                 loaded_texture_2 = tex->category;
                 if (loaded_texture_2 < 48) {
@@ -1443,8 +1443,8 @@ RECOMP_PATCH void render_dynamic_texture_billboards_6AE758(void) {
     }
 
     billboard_signature_override_end();
-    D_803D2E08.unk0 = -1;
-    D_803D2E08.unk1 = -1;
+    gDynamicTextureBillboardQueue.unk0 = -1;
+    gDynamicTextureBillboardQueue.unk1 = -1;
 }
 
 RECOMP_PATCH s16 classify_visibility_and_draw_fov_mask(

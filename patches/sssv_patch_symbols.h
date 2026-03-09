@@ -7,7 +7,7 @@ extern DisplayList* gDisplayListContext;
 extern FrameContextMinimal* gFrameContext;
 extern u16 gDepthImage[];
 extern VIDataMinimal gVIData;
-extern DynamicTexturesMinimal D_803D2E08;
+extern DynamicTexturesMinimal gDynamicTextureBillboardQueue;
 extern u16 gIntroPerspNorm[2];
 extern u16 gWorldPerspNorm;
 extern s16 gSineTable256[256];
@@ -140,7 +140,7 @@ extern void draw_sprite_with_prim_depth(Gfx** dl, uSprite* sprite, u16 width, u1
 extern void build_rotate_scale_translate_matrix(Mtx* arg0, s32 arg1, s32 arg2, s32 arg3, s16 arg4, s16 arg5, s16 arg6, s32 arg7, s32 arg8, s32 arg9);
 extern void draw_rectangle(Gfx** dl, s16 x0, s16 y0, s16 x1, s16 y1, u8 r, u8 g, u8 b, u8 alpha);
 extern void render_title_screen_frame(FrameContextMinimal* arg0);
-extern void func_8029D8D8_6AEF88(Gfx** arg0, s16 arg1);
+extern void load_dynamic_texture_billboard_texture_pair(Gfx** arg0, s16 arg1);
 extern void recomp_patch_debug_u32(u32 tag, u32 a, u32 b, u32 c);
 extern void display_score(Gfx** dl, u8* score, u16 x_offset, u16 y_offset);
 extern void prepare_text(u8* src, s16* dst);
