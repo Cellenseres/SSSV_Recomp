@@ -9,9 +9,25 @@
 #define G_CD_BAYER 0x00000040u
 #endif
 
+#ifndef G_CD_DISABLE
+#define G_CD_DISABLE 0x000000C0u
+#endif
+
 #ifndef G_AD_PATTERN
 #define G_AD_PATTERN 0x00000000u
 #endif
+
+#ifndef gDPSetTextureLOD
+static inline void gDPSetTextureLOD_(Gfx* pkt, u32 mode) {
+    pkt->words.w0 = 0xBA001002u;
+    pkt->words.w1 = mode;
+}
+#define gDPSetTextureLOD(pkt, mode) gDPSetTextureLOD_(pkt, mode)
+#endif
+
+#define SEG_GFX_010043A0 ((Gfx*)0x010043A0u)
+#define SEG_GFX_01004458 ((Gfx*)0x01004458u)
+#define SEG_TEX_01021BB0 ((u8*)0x01021BB0u)
 
 static u32 g_dbg_draw_rectangle_calls = 0;
 static u32 g_dbg_intro_frame_calls = 0;
@@ -801,13 +817,33 @@ RECOMP_PATCH void setup_world_perspective_6AB090(DisplayList* arg0) {
     );
     guScale(&arg0->unk37450, 0.5f, 0.5f, 0.5f);
     guScale(&arg0->unk374D0, 1.0f, 1.0f, 1.0f);
+
     update_world_camera_transform();
+
+#if SSSV_PATCH_SHIP_WINDOW_XLU_STATE_BARRIER
+    // `unkBB80` starts with geometry only. Seed the translucent world pass
+    // with the canonical world state so it does not inherit the opaque pass'
+    // last MODELVIEW.
+    gSPMatrix(gXluDL++, &arg0->unk37410, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+    gSPMatrix(gXluDL++, &arg0->unk37450, G_MTX_NOPUSH | G_MTX_MUL | G_MTX_PROJECTION);
+    gSPMatrix(gXluDL++, &arg0->unk37490, G_MTX_NOPUSH | G_MTX_MUL | G_MTX_PROJECTION);
+    gSPMatrix(gXluDL++, &arg0->unk374D0, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+    gSPPerspNormalize(gXluDL++, gWorldPerspNorm);
+#endif
 
     g_dbg_world_perspective_calls++;
     if (SHOULD_TRACE_PERIODIC(g_dbg_world_perspective_calls, 6, 240)) {
         const s32 aspect_x1000 = (s32)(target_aspect * 1000.0f + 0.5f);
         PATCH_TRACE(PATCH_TAG_WORLD_PERSPECTIVE, g_dbg_world_perspective_calls, (u32)aspect_x1000, (u16)target_width);
     }
+}
+
+static inline void emit_world_render_state(DisplayList* arg0, Gfx** arg1) {
+    gSPMatrix((*arg1)++, &arg0->unk37410, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+    gSPMatrix((*arg1)++, &arg0->unk37450, G_MTX_NOPUSH | G_MTX_MUL | G_MTX_PROJECTION);
+    gSPMatrix((*arg1)++, &arg0->unk37490, G_MTX_NOPUSH | G_MTX_MUL | G_MTX_PROJECTION);
+    gSPMatrix((*arg1)++, &arg0->unk374D0, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+    gSPPerspNormalize((*arg1)++, gWorldPerspNorm);
 }
 
 RECOMP_PATCH void setup_frame_render_state(DisplayList* arg0, Gfx** arg1) {
@@ -824,15 +860,103 @@ RECOMP_PATCH void setup_frame_render_state(DisplayList* arg0, Gfx** arg1) {
         gSPViewport((*arg1)++, &gMainViewport);
     }
 
-    gSPMatrix((*arg1)++, &arg0->unk37410, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
-    gSPMatrix((*arg1)++, &arg0->unk37450, G_MTX_NOPUSH | G_MTX_MUL | G_MTX_PROJECTION);
-    gSPMatrix((*arg1)++, &arg0->unk37490, G_MTX_NOPUSH | G_MTX_MUL | G_MTX_PROJECTION);
-    gSPMatrix((*arg1)++, &arg0->unk374D0, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
-    gSPPerspNormalize((*arg1)++, gWorldPerspNorm);
+    emit_world_render_state(arg0, arg1);
 
     trace_proj_view_snapshot_once(ctx);
 
     if (cur_perspective_projection_transform_id != 0) {
         rt64_tag_projection_matrix(arg1, (u32)cur_perspective_projection_transform_id);
     }
+}
+
+RECOMP_PATCH void draw_visible_world_cell_opaque_pass(DisplayList* arg0) {
+    // These world-cell lists contain geometry only. Re-emit the world state
+    // before the first draw so they do not inherit the previous MODELVIEW.
+    emit_world_render_state(arg0, &gMainDL);
+
+    gDPSetTextureImage(gMainDL++, G_IM_FMT_I, G_IM_SIZ_8b, 16, &gWaterTextureBuffer[(gWaterAnimState.unk20C >> 1) << 9]);
+    gDPSetTile(gMainDL++, G_IM_FMT_I, G_IM_SIZ_8b, 2, 0x0180, G_TX_LOADTILE, 0, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOLOD, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOLOD);
+    gDPLoadSync(gMainDL++);
+    gDPLoadTile(gMainDL++, G_TX_LOADTILE, 0, 0, 4 * (15.5), 4 * (31));
+    gDPPipeSync(gMainDL++);
+    gDPSetTile(gMainDL++, G_IM_FMT_I, G_IM_SIZ_4b, 2, 0x0180, 6, 0, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOLOD, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOLOD);
+    gDPSetTileSize(gMainDL++, 6, 0, 0, 4 * (31), 4 * (31));
+
+    gDPSetTextureImage(gMainDL++, G_IM_FMT_I, G_IM_SIZ_8b, 8, SEG_TEX_01021BB0);
+    gDPSetTile(gMainDL++, G_IM_FMT_I, G_IM_SIZ_8b, 1, 0x01C0, G_TX_LOADTILE, 0, G_TX_NOMIRROR | G_TX_WRAP, 4, G_TX_NOLOD, G_TX_NOMIRROR | G_TX_WRAP, 4, G_TX_NOLOD);
+    gDPLoadSync(gMainDL++);
+    gDPLoadTile(gMainDL++, G_TX_LOADTILE, 0, 0, 4 * (7.5), 4 * (15));
+    gDPPipeSync(gMainDL++);
+    gDPSetTile(gMainDL++, G_IM_FMT_I, G_IM_SIZ_4b, 1, 0x01C0, 5, 0, G_TX_NOMIRROR | G_TX_WRAP, 4, G_TX_NOLOD, G_TX_NOMIRROR | G_TX_WRAP, 4, G_TX_NOLOD);
+    gDPSetTileSize(gMainDL++, 5, 0, 0, 4 * (15), 4 * (15));
+
+    gSPDisplayList(gMainDL++, SEG_GFX_010043A0);
+
+    build_visible_world_cell_queue((s32)gCameras[gCameraId].unk74, (s32)gCameras[gCameraId].unk78, (s32)gCameras[gCameraId].unk7C);
+
+    for (gVisibleWorldCellCount = 0; gVisibleWorldCellQueue[gVisibleWorldCellCount].start != 99; gVisibleWorldCellCount++) {
+        gSPDisplayList(gMainDL++, gWorldCellOpaqueDisplayLists[gVisibleWorldCellQueue[gVisibleWorldCellCount].start][gVisibleWorldCellQueue[gVisibleWorldCellCount].end]);
+    }
+
+    gDPSetTextureLOD(gMainDL++, G_TL_TILE);
+}
+
+RECOMP_PATCH void draw_visible_world_cell_translucent_pass(DisplayList* arg0) {
+    s32 i;
+    s32 j;
+    GfxHelperMinimal old;
+
+    // Same contract as the opaque world-cell path: geometry only, no local
+    // reset. Start from a clean world state.
+    emit_world_render_state(arg0, &gMainDL);
+
+    if ((D_803F2D18 > 10) && (gUiFlowState.unk0 == 2)) {
+        // Preserve the original no-op debug branch.
+    } else {
+        for (i = 0; i < gVisibleWorldCellCount - 1; i++) {
+            for (j = 0; j < gVisibleWorldCellCount - 1; j++) {
+                if (gVisibleWorldCellQueue[j].position < gVisibleWorldCellQueue[j + 1].position) {
+                    old = gVisibleWorldCellQueue[j];
+                    gVisibleWorldCellQueue[j] = gVisibleWorldCellQueue[j + 1];
+                    gVisibleWorldCellQueue[j + 1] = old;
+                }
+            }
+        }
+
+        gVisibleWorldCellQueue[gVisibleWorldCellCount].start = 99;
+
+        gDPSetTextureImage(gMainDL++, G_IM_FMT_I, G_IM_SIZ_8b, 16, &gWaterTextureBuffer[(gWaterAnimState.unk20C >> 1) << 9]);
+        gDPSetTile(gMainDL++, G_IM_FMT_I, G_IM_SIZ_8b, 2, 0x015E, G_TX_LOADTILE, 0, G_TX_NOMIRROR | G_TX_WRAP, 5, G_TX_NOLOD, G_TX_NOMIRROR | G_TX_WRAP, 5, G_TX_NOLOD);
+        gDPLoadSync(gMainDL++);
+        gDPLoadTile(gMainDL++, G_TX_LOADTILE, 0, 0, 4 * (15.5), 4 * (31));
+        gDPPipeSync(gMainDL++);
+        gDPSetTile(gMainDL++, G_IM_FMT_I, G_IM_SIZ_4b, 2, 0x015E, 1, 0, G_TX_NOMIRROR | G_TX_WRAP, 5, G_TX_NOLOD, G_TX_NOMIRROR | G_TX_WRAP, 5, G_TX_NOLOD);
+        gDPSetTileSize(gMainDL++, 1, 0, 0, 4 * (31), 4 * (31));
+
+        gDPSetTextureImage(gMainDL++, G_IM_FMT_I, G_IM_SIZ_8b, 8, SEG_TEX_01021BB0);
+        gDPSetTile(gMainDL++, G_IM_FMT_I, G_IM_SIZ_8b, 1, 0x01D7, G_TX_LOADTILE, 0, G_TX_NOMIRROR | G_TX_WRAP, 4, G_TX_NOLOD, G_TX_NOMIRROR | G_TX_WRAP, 4, G_TX_NOLOD);
+        gDPLoadSync(gMainDL++);
+        gDPLoadTile(gMainDL++, G_TX_LOADTILE, 0, 0, 4 * (7.5), 4 * (15));
+        gDPPipeSync(gMainDL++);
+        gDPSetTile(gMainDL++, G_IM_FMT_I, G_IM_SIZ_4b, 1, 0x01D7, 5, 0, G_TX_NOMIRROR | G_TX_WRAP, 4, G_TX_NOLOD, G_TX_NOMIRROR | G_TX_WRAP, 4, G_TX_NOLOD);
+        gDPSetTileSize(gMainDL++, 5, 0, 0, 4 * (15), 4 * (15));
+        gDPSetEnvColor(gMainDL++, 0x00, 0x00, 0x80, 0x00);
+        gDPSetPrimColor(gMainDL++, 0, 128, 128, 160, 190, 200);
+
+        gSPDisplayList(gMainDL++, SEG_GFX_01004458);
+
+        gDPSetColorDither(gMainDL++, G_CD_DISABLE);
+        gDPSetAlphaDither(gMainDL++, G_AD_PATTERN);
+        gDPSetAlphaCompare(gMainDL++, G_AC_NONE);
+
+        for (gVisibleWorldCellCount = 0; gVisibleWorldCellQueue[gVisibleWorldCellCount].start != 99; gVisibleWorldCellCount++) {
+            if (gWorldCellTranslucentEnabled[gVisibleWorldCellQueue[gVisibleWorldCellCount].start][gVisibleWorldCellQueue[gVisibleWorldCellCount].end] == 1) {
+                gSPDisplayList(gMainDL++, gWorldCellTranslucentDisplayLists[gVisibleWorldCellQueue[gVisibleWorldCellCount].start][gVisibleWorldCellQueue[gVisibleWorldCellCount].end]);
+            }
+        }
+    }
+
+    gDPSetColorDither(gMainDL++, G_CD_BAYER);
+    gDPSetAlphaDither(gMainDL++, G_AD_PATTERN);
+    gDPSetTextureLOD(gMainDL++, G_TL_TILE);
 }

@@ -32,23 +32,7 @@ RECOMP_PATCH s16 classify_object_visibility_6FA0A0(
         }
     }
 
-    if (gCameraVisibilityMask[6] & 3) {
-        if (gCameraVisibilityMask[6] & 1) {
-            if ((classify_visibility_simple(xPos, zPos, ((gCameraVisibilityMask[6] & 0xFFC) << 0x12) - yPos, arg3, arg8) == 0) && (arg9 == 0)) {
-                return VISIBILITY_VISIBLE;
-            } else {
-                return classify_visibility_and_draw_fov_mask(xPos, zPos, yPos, arg3, fovImageIdx, arg5, arg6, arg7, arg8, arg9);
-            }
-        }
-
-        if ((classify_visibility_simple(((gCameraVisibilityMask[6] & 0xFFC) << 0x12) - xPos, zPos, yPos, arg3, arg8) == 0) && (arg9 == 0)) {
-            return VISIBILITY_VISIBLE;
-        } else {
-            return classify_visibility_and_draw_fov_mask(xPos, zPos, yPos, arg3, fovImageIdx, arg5, arg6, arg7, arg8, arg9);
-        }
-    } else {
-        return classify_visibility_and_draw_fov_mask(xPos, zPos, yPos, arg3, fovImageIdx, arg5, arg6, arg7, arg8, arg9);
-    }
+    return classify_visibility_and_draw_fov_mask(xPos, zPos, yPos, arg3, fovImageIdx, arg5, arg6, arg7, arg8, arg9);
 }
 
 RECOMP_PATCH s16 classify_dynamic_visibility_6FA26C(
@@ -74,13 +58,5 @@ RECOMP_PATCH s16 classify_dynamic_visibility_6FA26C(
         }
     }
 
-    if (gCameraVisibilityMask[6] & 1) {
-        if ((classify_visibility_simple(xPos, zPos, ((gCameraVisibilityMask[6] & 0xFFC) << 0x12) - yPos, arg3, arg8) == 0) && (arg9 == 0)) {
-            return VISIBILITY_VISIBLE;
-        }
-
-        return classify_visibility_and_draw_fov_mask(xPos, zPos, yPos, arg3, fovImageIdx, arg5, arg6, arg7, arg8, arg9);
-    } else {
-        return classify_visibility_and_draw_fov_mask(xPos, zPos, yPos, arg3, fovImageIdx, arg5, arg6, arg7, arg8, arg9);
-    }
+    return classify_visibility_and_draw_fov_mask(xPos, zPos, yPos, arg3, fovImageIdx, arg5, arg6, arg7, arg8, arg9);
 }

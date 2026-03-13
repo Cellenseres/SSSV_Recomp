@@ -4042,7 +4042,7 @@ segments:
     # .data / .rodata
     - [0x7B1B90, .data, overlay2_6A6500] # D_803A04E0_7B1B90
     - [0x7B1BA0, .data, overlay2_6A7A80] # D_803A04F0_7B1BA0
-    - [0x7B1BB0, .data, overlay2_6AB090] # D_803A0500_7B1BB0
+    - [0x7B1BB0, .data, overlay2_6AB090] # gVisibleWorldCellCount
     - [0x7B1BC0, .data, overlay2_6AC6B0] # D_803A0510_7B1BC0
     - [0x7B1BE0, .data, overlay2_6ACF20] # D_803A0530_7B1BE0
     - [0x7B1C30, .data, overlay2_6AE5A0] # D_803A0580_7B1C30 overlay2_6ACF20
@@ -4225,7 +4225,7 @@ segments:
     - { start: 0x7D1AD0, type: .bss, name: sssv/camera } # , vram: 0x803F28B0 }
     - { start: 0x7D1AD0, type: .bss, name: overlay2_7558F0 } # , vram: 0x803F2C80 }
     - { start: 0x7D1AD0, type: .bss, name: sssv/osd } # , vram: 0x803F2CD0 }
-    - { start: 0x7D1AD0, type: .bss, name: sssv/init }  # , vram: 0x803F2D10 }
+    - { start: 0x7D1AD0, type: .bss, name: sssv/init }  # gUiFlowState @ 0x803F2D10
     - { start: 0x7D1AD0, type: .bss, name: overlay2_7688B0 }  # , vram: 0x803F2D20 }
     - { start: 0x7D1AD0, type: .bss, name: overlay2_7689A0 }  # , vram: 0x803F2D30 }
     - { start: 0x7D1AD0, type: .bss, name: sssv/animals/chameleon } # , vram: 0x803F2D50 }

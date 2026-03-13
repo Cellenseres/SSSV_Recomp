@@ -493,15 +493,14 @@ extern "C" void recomp_get_patch_diag_flags(uint8_t* rdram, recomp_context* ctx)
 }
 
 extern "C" void recomp_patch_debug_u32(uint8_t* rdram, recomp_context* ctx) {
-#if defined(NDEBUG)
-    (void)rdram;
-    (void)ctx;
-#else
     const uint32_t tag = static_cast<uint32_t>(_arg<0, int32_t>(rdram, ctx));
     const uint32_t a = static_cast<uint32_t>(_arg<1, int32_t>(rdram, ctx));
     const uint32_t b = static_cast<uint32_t>(_arg<2, int32_t>(rdram, ctx));
     const uint32_t c = static_cast<uint32_t>(_arg<3, int32_t>(rdram, ctx));
 
+#if defined(NDEBUG)
+    (void)a; (void)b; (void)c;
+#else
     if (!patch_trace_tag_enabled(tag)) {
         return;
     }
@@ -641,7 +640,6 @@ extern "C" void recomp_patch_debug_u32(uint8_t* rdram, recomp_context* ctx) {
         );
         return;
     }
-
     patch_trace_printf(
         "[SSSV:PATCH] %s tag=%u a=%u b=%u c=%u\n",
         tag_name,

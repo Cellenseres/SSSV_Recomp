@@ -19,6 +19,10 @@
 
 #define SSSV_PATCH_DISABLE_LOD 1
 #define SSSV_PATCH_DISABLE_FAR_AWAY_CULL 1
+#define SSSV_PATCH_TRANSPARENT_SHIP_GLASS 0
+#define SSSV_PATCH_DISABLE_PB_UFO_GLASS_OBJECT 0
+#define SSSV_PATCH_SHIP_WINDOW_XLU_STATE_BARRIER 1
+#define SSSV_PATCH_FIX_MODELVIEW_STACK_BALANCE 1
 
 #define SFX_CHEAT_ENABLED 86
 #define CHEAT_INPUT_BUFFER_ADDR ((u8*)0x803F6410)
@@ -71,6 +75,24 @@ typedef union {
     uSprite_t s;
     long long force_structure_alignment[3];
 } uSprite;
+
+typedef struct {
+    s16 start;
+    s16 end;
+    s32 position;
+} GfxHelperMinimal;
+
+typedef struct {
+    u8 pad0[0x74];
+    f32 unk74;
+    f32 unk78;
+    f32 unk7C;
+} CameraMinimal;
+
+typedef struct {
+    u8 pad0[0x20C];
+    u8 unk20C;
+} WaterAnimStateMinimal;
 
 typedef struct {
     u8 pad0000[0x0008];
@@ -257,6 +279,21 @@ typedef struct {
 } TrigLutMinimal;
 
 typedef struct {
+    f32 rotation_euler[3];
+    f32 translation[3];
+} RigTransformStateMinimal;
+
+typedef struct {
+    RigTransformStateMinimal current;
+    RigTransformStateMinimal start;
+    RigTransformStateMinimal target;
+    f32 frame;
+    f32 duration;
+    s16 active;
+    u8 pad52[2];
+} RigPoseStateMinimal;
+
+typedef struct {
     s16 unk0;
     s16 unk2;
     s16 transitionId;
@@ -288,6 +325,8 @@ _Static_assert(offsetof(LevelProgressMinimal, score) == 0x0, "LevelProgressMinim
 _Static_assert(offsetof(LevelProgressMinimal, scoreText) == 0xE, "LevelProgressMinimal.scoreText offset mismatch");
 _Static_assert(sizeof(FogMinimal) == 0x8, "FogMinimal size mismatch");
 _Static_assert(offsetof(TrigLutMinimal, unk2D0) == 0x2D0, "TrigLutMinimal.unk2D0 offset mismatch");
+_Static_assert(sizeof(RigTransformStateMinimal) == 0x18, "RigTransformStateMinimal size mismatch");
+_Static_assert(sizeof(RigPoseStateMinimal) == 0x54, "RigPoseStateMinimal size mismatch");
 _Static_assert(sizeof(ScreenTransitionMinimal) == 0xA, "ScreenTransitionMinimal size mismatch");
 _Static_assert(offsetof(OverlayUiStateMinimal, unk48) == 0x48, "OverlayUiStateMinimal.unk48 offset mismatch");
 _Static_assert(sizeof(UiFlowStateMinimal) == 0x4, "UiFlowStateMinimal size mismatch");

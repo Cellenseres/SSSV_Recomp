@@ -509,7 +509,7 @@ RECOMP_PATCH void render_terminal_background_frame(void) {
                     gTerminalFadeStep = 0;
                     gTerminalTransitionCounter = 1;
                     gTerminalFrameCounter = 0;
-                    D_803F2D10.unk0 = 0;
+                    gUiFlowState.unk0 = 0;
                     D_803F2C6C = 0;
                     D_803F2C6D = 0;
                     gTerminalPhase = 0;
@@ -539,7 +539,7 @@ RECOMP_PATCH void render_terminal_background_frame(void) {
             if (gTerminalFrameCounter == 40) {
                 gTerminalFrameCounter = 0;
                 gCameraUiState = 0;
-                D_803F2D10.unk0 = 0;
+                gUiFlowState.unk0 = 0;
                 D_803F2C6C = 0;
                 D_803F2C6D = 0;
                 gTerminalPhase = 0;
