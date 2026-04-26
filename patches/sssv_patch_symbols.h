@@ -4,7 +4,7 @@
 #include "sssv_patch_types.h"
 
 extern DisplayList* gDisplayListContext;
-extern FrameContextMinimal* gFrameContext;
+extern FrameContextMinimal* gFrameContextPtr;
 extern u16 gDepthImage[];
 extern VIDataMinimal gVIData;
 extern DynamicTexturesMinimal gDynamicTextureBillboardQueue;
@@ -35,7 +35,7 @@ extern f32 recomp_get_target_aspect_ratio(f32 original_aspect);
 extern s16 gHudTimerSeconds;
 extern s16* gHudCenterText;
 extern s16 gHudBarBaseY;
-extern LevelProgressMinimal gLevelProgress;
+extern LevelProgressMinimal gGameState;
 extern u8 gHudTimerAscii[];
 extern u8 gCameraUiState;
 extern u8 D_803F2AA3;

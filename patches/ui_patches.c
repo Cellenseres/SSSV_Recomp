@@ -29,9 +29,9 @@ static inline void end_hud_pass(void) {
 RECOMP_PATCH void osd_draw_score(void) {
     const u8 font_lcd = 1;
     const u32 hud_id = begin_hud_pass();
-    sprintf((char*)gLevelProgress.scoreText, "%8d", gLevelProgress.score);
+    sprintf((char*)gGameState.scoreText, "%8d", gGameState.score);
     select_font(0, font_lcd, 1, 0);
-    display_score(&gMainDL, (u8*)gLevelProgress.scoreText, ui_safe_right_anchor(34), (u16)((gHudBarBaseY >> 2) - 10));
+    display_score(&gMainDL, (u8*)gGameState.scoreText, ui_safe_right_anchor(34), (u16)((gHudBarBaseY >> 2) - 10));
     end_hud_pass();
 
     g_dbg_osd_score_calls++;

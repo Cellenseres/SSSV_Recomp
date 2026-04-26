@@ -127,7 +127,7 @@ static inline void set_framebuffer_color_image(Gfx** dl) {
         G_IM_FMT_RGBA,
         G_IM_SIZ_16b,
         SSSV_BASE_WIDTH,
-        (const void*)(uintptr_t)osVirtualToPhysical((void*)gFrameContext->framebuffer)
+        (const void*)(uintptr_t)osVirtualToPhysical((void*)gFrameContextPtr->framebuffer)
     );
 }
 
@@ -359,7 +359,7 @@ RECOMP_PATCH void load_segments(Gfx **arg0, DisplayList *ddl) {
 }
 
 static inline void append_world_depth_clear_failsafe(void) {
-    if ((gMainDL == NULL) || (gFrameContext == NULL)) {
+    if ((gMainDL == NULL) || (gFrameContextPtr == NULL)) {
         return;
     }
 
@@ -491,7 +491,7 @@ static inline s32 overlay_widescreen_active(void) {
 }
 
 static inline void append_intro_depth_clear_fallback(Gfx** dl) {
-    if ((dl == NULL) || (*dl == NULL) || (gFrameContext == NULL)) {
+    if ((dl == NULL) || (*dl == NULL) || (gFrameContextPtr == NULL)) {
         return;
     }
 
@@ -746,7 +746,7 @@ RECOMP_PATCH void render_intro_overlay_frame_63BF88(void) {
     gDisplayListContext->unk39310 = 0;
     gDisplayListContext->usedHilites = 0;
 
-    render_title_screen_frame(gFrameContext);
+    render_title_screen_frame(gFrameContextPtr);
     append_intro_black_border_mask(&gMainDL);
     if (gIntroTransitionPending != 0) {
         gCurrentOverlay = 0;

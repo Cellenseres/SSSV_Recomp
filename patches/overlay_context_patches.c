@@ -91,7 +91,7 @@ RECOMP_PATCH void setup_pause_menu_perspective_a_7A6B30(void) {
     gSPSegment(gMainDL++, 0x04, (const void*)(uintptr_t)osVirtualToPhysical(gMenuSegmentBase));
     gSPViewport(gMainDL++, &gOverlayViewport);
     clear_depth_buffer(&gMainDL);
-    gDPSetColorImage(gMainDL++, G_IM_FMT_RGBA, G_IM_SIZ_16b, 320, (const void*)(uintptr_t)osVirtualToPhysical(gFrameContext->framebuffer));
+    gDPSetColorImage(gMainDL++, G_IM_FMT_RGBA, G_IM_SIZ_16b, 320, (const void*)(uintptr_t)osVirtualToPhysical(gFrameContextPtr->framebuffer));
     patch_clear_overlay_color(&gMainDL);
 
     guPerspective(&gDisplayListContext->unk37410, &gWorldPerspNorm, 45.0f, get_target_aspect(), 2.0f, 2000.0f, 1.0f);
@@ -136,7 +136,7 @@ RECOMP_PATCH void setup_pause_menu_perspective_b_7A6F04(void) {
 
     gSPSegment(gMainDL++, 0x04, (const void*)(uintptr_t)osVirtualToPhysical(gMenuSegmentBase));
     gSPViewport(gMainDL++, &gOverlayViewport);
-    gDPSetColorImage(gMainDL++, G_IM_FMT_RGBA, G_IM_SIZ_16b, 320, (const void*)(uintptr_t)osVirtualToPhysical(gFrameContext->framebuffer));
+    gDPSetColorImage(gMainDL++, G_IM_FMT_RGBA, G_IM_SIZ_16b, 320, (const void*)(uintptr_t)osVirtualToPhysical(gFrameContextPtr->framebuffer));
     patch_clear_overlay_color(&gMainDL);
 
     guPerspective(&gDisplayListContext->unk37410, &gWorldPerspNorm, 45.0f, get_target_aspect(), 2.0f, 6000.0f, 1.0f);
@@ -196,7 +196,7 @@ RECOMP_PATCH void render_terminal_background_scene(void) {
         G_IM_FMT_RGBA,
         G_IM_SIZ_16b,
         320,
-        (const void*)(uintptr_t)osVirtualToPhysical(gFrameContext->framebuffer)
+        (const void*)(uintptr_t)osVirtualToPhysical(gFrameContextPtr->framebuffer)
     );
     display_policy_safe_scissor_bounds(&scissor_ulx, &scissor_uly, &scissor_lrx, &scissor_lry);
     gDPSetScissor(gMainDL++, G_SC_NON_INTERLACE, scissor_ulx, scissor_uly, scissor_lrx, scissor_lry);
@@ -382,7 +382,7 @@ RECOMP_PATCH void render_terminal_background_frame(void) {
         G_IM_FMT_RGBA,
         G_IM_SIZ_16b,
         320,
-        (const void*)(uintptr_t)osVirtualToPhysical(gFrameContext->framebuffer)
+        (const void*)(uintptr_t)osVirtualToPhysical(gFrameContextPtr->framebuffer)
     );
     patch_apply_safe_scissor(&gMainDL);
     patch_gSPFogFactor(gMainDL++, -3072, -22016);
@@ -471,7 +471,7 @@ RECOMP_PATCH void render_terminal_background_frame(void) {
                     G_IM_SIZ_16b,
                     320,
                     (const void*)(uintptr_t)osVirtualToPhysical(
-                        gFrameContext->framebuffer + ((((s32)slice_y) * 10) << 6)
+                        gFrameContextPtr->framebuffer + ((((s32)slice_y) * 10) << 6)
                     )
                 );
 
@@ -486,7 +486,7 @@ RECOMP_PATCH void render_terminal_background_frame(void) {
                 G_IM_FMT_RGBA,
                 G_IM_SIZ_16b,
                 320,
-                (const void*)(uintptr_t)osVirtualToPhysical(gFrameContext->framebuffer)
+                (const void*)(uintptr_t)osVirtualToPhysical(gFrameContextPtr->framebuffer)
             );
             patch_apply_safe_scissor(&gMainDL);
 
