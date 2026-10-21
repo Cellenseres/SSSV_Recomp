@@ -104,7 +104,9 @@ RECOMP_PATCH void render_rig_instance_xlu(s32 x, s32 y, s32 z, s16 pitch, s16 ya
         gSPPopMatrix(gXluDL++, G_MTX_MODELVIEW);
     }
 
-    append_joint_pose_transform(1, &gRigPoseStates[pose_bank][1]);
+    // The original pushes joint 1 a second time here, so part 9 gets the joint 1 offset twice:
+    // Evo's visor floats a head-height above him in the intro cockpit. The pop above already
+    // restored the joint 1 level, so push joint 3 from there.
 
     if (pose_bank == 1) {
         gDPSetPrimColor(gXluDL++, 0, 0, 0xEA, 0xE6, 0xFF, 0xFF);
@@ -120,7 +122,6 @@ RECOMP_PATCH void render_rig_instance_xlu(s32 x, s32 y, s32 z, s16 pitch, s16 ya
     append_joint_pose_transform(1, &gRigPoseStates[pose_bank][3]);
 
     gSPDisplayList(gXluDL++, gRigPartDisplayLists[rig_variant][9]);
-    gSPPopMatrix(gXluDL++, G_MTX_MODELVIEW);
     gSPPopMatrix(gXluDL++, G_MTX_MODELVIEW);
     gSPPopMatrix(gXluDL++, G_MTX_MODELVIEW);
 

@@ -456,7 +456,12 @@ RECOMP_PATCH void render_terminal_background_frame(void) {
 
             gScreenWidth = terminal_frame_width;
             load_default_display_list(&gMainDL);
-            patch_clear_overlay_color(&gMainDL);
+            // The original only darkens the previous frame here (the translucent rectangle above), which
+            // leaves the trails behind the glyphs, DNA and animal. In widescreen a native-width copy of
+            // the stat text also stays visible that way, so the frame is only cleared there.
+            if (terminal_frame_width > SSSV_BASE_WIDTH) {
+                patch_clear_overlay_color(&gMainDL);
+            }
             set_menu_text_color(0xFF, 0xFF, 0xFF, 0xFF);
             select_font(0, FONT_COMIC_SANS_PATCH, 1, 0);
             update_terminal_scene_lighting(0xFF);

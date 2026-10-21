@@ -36,6 +36,10 @@ static u32 g_dbg_world_perspective_calls = 0;
 static u32 g_dbg_depth_clear_calls = 0;
 static u32 g_dbg_world_depth_failsafe_calls = 0;
 
+// End of the world state at the start of the translucent object list, so the dome reflection replay
+// (ship_window_patches.c) can run the list without the projection reload.
+Gfx* gXluStateBarrierEnd = NULL;
+
 void setup_intro_perspective_638558(Gfx** dl);
 
 static inline void write_main_viewport_expand(s16 viewport_width, s16 viewport_height) {
@@ -257,6 +261,35 @@ static inline void patch_world_chunk_clip_ratio_dl(void) {
     }
 }
 
+// The TV screen model (Something Fishy monitors) draws its static as a white quad with prim alpha 0x80
+// and G_AC_DITHER, in 2-cycle mode with G_CC_PASS2 / G_CC_PRIMITIVE. The alpha compare uses the first
+// cycle's alpha, which there is COMBINED: on hardware that still holds the previous pixel's output (~0x80),
+// so about half the pixels pass at random. RT64 starts COMBINED at 0, every pixel fails and the screen
+// stays black. Use PRIMITIVE in the first cycle as well so the dither compares against the prim alpha.
+#define TV_SCREEN_DL_SEGMENT_OFFSET 0x00017AA0u
+#define TV_SCREEN_STATIC_COMBINE_INDEX 27
+
+static inline void patch_tv_screen_static_dl(void) {
+    Gfx* cmd;
+    Gfx original;
+    Gfx fixed;
+
+    if (gSegment1Base == NULL) {
+        return;
+    }
+
+    cmd = &((Gfx*)((u8*)gSegment1Base + TV_SCREEN_DL_SEGMENT_OFFSET))[TV_SCREEN_STATIC_COMBINE_INDEX];
+    gDPSetCombineMode(&original, G_CC_PASS2, G_CC_PRIMITIVE);
+    gDPSetCombineMode(&fixed, G_CC_PRIMITIVE, G_CC_PRIMITIVE);
+
+    // Only touch it while segment 1 holds the TV model (the previous command is its dithered render mode).
+    if ((cmd->words.w0 == original.words.w0) && (cmd->words.w1 == original.words.w1) &&
+        ((cmd[-1].words.w0 & 0xFF000000u) == 0xB9000000u) && ((cmd[-1].words.w1 & 0x3u) == 0x3u)) {
+        cmd->words.w0 = fixed.words.w0;
+        cmd->words.w1 = fixed.words.w1;
+    }
+}
+
 static inline void append_sp_set_geometry_mode_cmd(Gfx** dl, u32 mode) {
     (*dl)->words.w0 = 0xB7000000u;
     (*dl)->words.w1 = mode;
@@ -346,6 +379,7 @@ RECOMP_PATCH void load_segments(Gfx **arg0, DisplayList *ddl) {
     if (rc_world_projection_active()) {
         patch_world_chunk_clip_ratio_dl();
     }
+    patch_tv_screen_static_dl();
 
     gSPSegment((*arg0)++, 0, 0);
     gSPSegment((*arg0)++, 1, (const void*)(uintptr_t)osVirtualToPhysical(gSegment1Base));
@@ -477,7 +511,9 @@ RECOMP_PATCH void draw_rectangle(Gfx** dl, s16 x0, s16 y0, s16 x1, s16 y1, u8 r,
         gDPFillRectangle((*dl)++, draw_x0, draw_y0, draw_x1, draw_y1);
     }
 
-    gDPSetScissor((*dl)++, G_SC_NON_INTERLACE, 0, 0, screen_w, screen_h);
+    // The original restores the TV-safe frame scissor (8, 8, w - 8, h - 8) here; leaving it at
+    // full screen lets the 3D geometry drawn afterwards spill into the overscan border.
+    set_default_frame_scissor(dl);
     gDPPipeSync((*dl)++);
 
     g_dbg_draw_rectangle_calls++;
@@ -597,11 +633,9 @@ static inline void append_intro_black_border_mask(Gfx** dl) {
 }
 
 RECOMP_PATCH void draw_intro_logo_model(void) {
-    ScissorRect full_rect;
-
-    fill_full_scissor_rect(&full_rect);
-
-    gDPSetScissor(gMainDL++, G_SC_NON_INTERLACE, full_rect.ulx, full_rect.uly, full_rect.lrx, full_rect.lry);
+    // The original clips the logo ship to the TV-safe frame (8, 8, 312, 232); only widescreen
+    // may open it up to the full frame.
+    set_default_frame_scissor(&gMainDL);
     gSPDisplayList(gMainDL++, gOpaqueLit3DRenderSetupDl);
 
     guTranslate(
@@ -732,6 +766,10 @@ RECOMP_PATCH void render_intro_overlay_frame_63BF88(void) {
     gScreenWidth = target_width;
     gScreenHeight = SSSV_BASE_HEIGHT;
     load_segments(&gMainDL, gDisplayListContext);
+
+    // Title and attract frames are grabbed from RDRAM for the transition into the game.
+    rc_ensure_rt64_extended_enabled(&gMainDL);
+    gEXSetRenderToRAM(gMainDL++, 1);
     clear_depth_buffer(&gMainDL);
     write_main_viewport_expand(gScreenWidth, gScreenHeight);
 
@@ -802,6 +840,11 @@ RECOMP_PATCH void setup_world_perspective_6AB090(DisplayList* arg0) {
     rc_ensure_rt64_extended_enabled(&gLayer0DL);
     rc_ensure_rt64_extended_enabled(&gAuxDL);
 
+    // Writing every rendered frame back to RDRAM costs a GPU readback that scales with the output
+    // resolution (2x: ~25 fps instead of 30 on weaker GPUs). In gameplay the game only reads a frame
+    // back while entering the pause menu, where it copies the previous frame into the menu thumbnail.
+    gEXSetRenderToRAM(gMainDL++, (gInitialisationState != 0) ? 1 : 0);
+
     if (target_width > SSSV_BASE_WIDTH) {
         append_world_depth_clear_failsafe();
     }
@@ -830,6 +873,7 @@ RECOMP_PATCH void setup_world_perspective_6AB090(DisplayList* arg0) {
     gSPMatrix(gXluDL++, &arg0->unk374D0, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
     gSPPerspNormalize(gXluDL++, gWorldPerspNorm);
 #endif
+    gXluStateBarrierEnd = gXluDL;
 
     g_dbg_world_perspective_calls++;
     if (SHOULD_TRACE_PERIODIC(g_dbg_world_perspective_calls, 6, 240)) {

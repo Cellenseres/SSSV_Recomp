@@ -20,6 +20,7 @@ extern u8 gLodDetailState;
 extern s16 gScreenWidth;
 extern s16 gScreenHeight;
 extern s8 gAttractModeState;
+extern u8 gInitialisationState;
 extern VpRaw gMainViewport;
 extern Gfx* gMainDL;
 extern Gfx* gOpaqueDL;
